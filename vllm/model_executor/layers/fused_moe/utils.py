@@ -247,8 +247,8 @@ def moe_kernel_quantize_input(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     # Handle OCP MX scheme that requires QDQ (quantize-dequantize) for emulation
     if ocp_mx_scheme is not None:
-        if ocp_mx_scheme in {"w_mxfp4", "w_mxfp4_a_mxfp4"}:
-            pass  # No QDQ needed for these schemes
+        if ocp_mx_scheme == "w_mxfp4_a_mxfp4":
+            return A, None  # activation quantization is performed within triton kernel
         elif ocp_mx_scheme.endswith("a_fp8"):
             # Perform QDQ (quantize and dequantize) on activation for emulation
             # purpose, because there is no native kernel for weight in ocp_mx_scheme

@@ -78,6 +78,128 @@ def write_zeros_to_output(
 
 
 @triton.jit
+def _mxfp4_quantize_block(
+    src_tensor,
+    valid_mask,
+    DEQUANT_SCALE_ROUNDING_MODE: tl.constexpr,
+):
+    BLOCK_SIZE_OUT_DIM: tl.constexpr = src_tensor.shape[0]
+    BLOCK_SIZE_QUANT_DIM: tl.constexpr = src_tensor.shape[1]
+    BLOCK_SIZE_QUANT_MX_SCALE: tl.constexpr = src_tensor.shape[1] // 32
+    tl.static_assert(
+        BLOCK_SIZE_QUANT_DIM % 32 == 0,
+        "BLOCK_SIZE_K must be a multiple of 32 for mxfp4 quantization",
+    )
+
+    f32_tensor = src_tensor.to(tl.float32)
+    abs_tensor = tl.abs(f32_tensor)
+    valid_mask_group = tl.reshape(
+        valid_mask, [BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_MX_SCALE, 32]
+    )
+    abs_tensor = tl.where(valid_mask_group, abs_tensor, -1.0)
+    abs_tensor = tl.reshape(
+        abs_tensor, [BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_MX_SCALE, 32]
+    )
+    max_val = tl.max(abs_tensor, axis=2, keep_dims=True)
+    has_valid = tl.max(valid_mask_group, axis=2, keep_dims=True)
+    max_val = tl.where(has_valid, max_val, 0.0)
+    dequant_scale = max_val / 6.0
+    if DEQUANT_SCALE_ROUNDING_MODE == 0:
+        dequant_scale_exponent = (
+            dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF
+        ) & 0x7F800000
+    else:
+        dequant_scale_exponent = dequant_scale.to(tl.uint32, bitcast=True) & 0x7F800000
+    dequant_scale_rounded = dequant_scale_exponent.to(tl.float32, bitcast=True)
+    quant_scale = tl.where(dequant_scale_rounded == 0, 0, 1.0 / dequant_scale_rounded)
+
+    f32_tensor = tl.reshape(
+        f32_tensor, [BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_MX_SCALE, 32]
+    )
+    quant_tensor = f32_tensor * quant_scale
+    quant_tensor = quant_tensor.reshape([BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_DIM])
+    quant_tensor = tl.where(valid_mask, quant_tensor, 0)
+    dequant_scale_exponent = dequant_scale_exponent.reshape(
+        [BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_MX_SCALE]
+    )
+
+    quant_tensor = quant_tensor.to(tl.uint32, bitcast=True)
+    signs = quant_tensor & 0x80000000
+    exponents = (quant_tensor >> 23) & 0xFF
+    mantissas = quant_tensor & 0x7FFFFF
+
+    E8_BIAS = 127
+    E2_BIAS = 1
+    adjusted_exponents = tl.core.sub(E8_BIAS, exponents + 1, sanitize_overflow=False)
+    mantissas = tl.where(
+        exponents < E8_BIAS,
+        (0x400000 | (mantissas >> 1)) >> adjusted_exponents,
+        mantissas,
+    )
+    exponents = tl.maximum(exponents, E8_BIAS - E2_BIAS) - (E8_BIAS - E2_BIAS)
+
+    e2m1_tmp = tl.minimum((((exponents << 2) | (mantissas >> 21)) + 1) >> 1, 0x7)
+    e2m1_value = ((signs >> 28) | e2m1_tmp).to(tl.uint8)
+
+    e2m1_value = tl.reshape(
+        e2m1_value, [BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_DIM // 2, 2]
+    )
+    evens, odds = tl.split(e2m1_value)
+    out_tensor = evens | (odds << 4)
+
+    dequant_scale_exponent = (dequant_scale_exponent >> 23).to(tl.uint8)
+    return out_tensor, dequant_scale_exponent
+
+
+@triton.jit
+def _mxfp4_upcast_block(
+    packed_tensor,
+    scale_tensor,
+    dst_dtype: tl.constexpr,
+):
+    BLOCK_SIZE_OUT_DIM: tl.constexpr = packed_tensor.shape[0]
+    BLOCK_SIZE_QUANT_DIM: tl.constexpr = packed_tensor.shape[1] * 2
+    BLOCK_SIZE_QUANT_MX_SCALE: tl.constexpr = BLOCK_SIZE_QUANT_DIM // 32
+    tl.static_assert(
+        BLOCK_SIZE_QUANT_DIM % 32 == 0,
+        "BLOCK_SIZE_K must be a multiple of 32 for mxfp4 upcast",
+    )
+
+    dst_bias: tl.constexpr = 127 if dst_dtype == tl.bfloat16 else 15
+    dst_0p5: tl.constexpr = 16128 if dst_dtype == tl.bfloat16 else 0x3800
+    dst_m_bits: tl.constexpr = 7 if dst_dtype == tl.bfloat16 else 10
+
+    em0 = packed_tensor & 0x07
+    em1 = packed_tensor & 0x70
+    x0 = (em0.to(tl.uint16) << (dst_m_bits - 1)) | (
+        (packed_tensor & 0x08).to(tl.uint16) << 12
+    )
+    x1 = (em1.to(tl.uint16) << (dst_m_bits - 5)) | (
+        (packed_tensor & 0x80).to(tl.uint16) << 8
+    )
+    x0 = tl.where((em0 & 0x06) != 0, x0 + ((dst_bias - 1) << dst_m_bits), x0)
+    x1 = tl.where((em1 & 0x60) != 0, x1 + ((dst_bias - 1) << dst_m_bits), x1)
+    x0 = tl.where(em0 == 0x01, dst_0p5 | (x0 & 0x8000), x0)
+    x1 = tl.where(em1 == 0x10, dst_0p5 | (x1 & 0x8000), x1)
+    dst_tensor = tl.interleave(x0, x1).to(dst_dtype, bitcast=True)
+
+    if dst_dtype == tl.bfloat16:
+        dst_scale = (scale_tensor.to(tl.uint16) << 7).to(dst_dtype, bitcast=True)
+    else:
+        dst_scale = (scale_tensor.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
+        dst_scale = dst_scale.to(tl.float16)
+
+    dst_tensor = dst_tensor.reshape([BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_MX_SCALE, 32])
+    dst_scale = dst_scale.reshape([BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_MX_SCALE, 1])
+    scale_tensor = scale_tensor.reshape(dst_scale.shape)
+
+    out_tensor = dst_tensor * dst_scale
+    out_tensor = tl.where(scale_tensor == 0xFF, float("nan"), out_tensor)
+    out_tensor = out_tensor.reshape([BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_DIM])
+    return out_tensor
+
+
+@triton.jit
 def fused_moe_kernel_gptq_awq(
     # Pointers to matrices
     a_ptr,
@@ -575,6 +697,178 @@ def fused_moe_kernel(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
+@triton.jit
+def fused_moe_kernel_mxfp4(
+    # Pointers to matrices
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    b_bias_ptr,
+    b_scale_ptr,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    # Matrix dimensions
+    N,
+    K,
+    EM,
+    num_valid_tokens,
+    # Strides
+    stride_am,
+    stride_ak,
+    stride_be,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_bse,
+    stride_bsk,
+    stride_bsn,
+    stride_bbe,
+    stride_bbn,
+    naive_block_assignment: tl.constexpr,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    top_k: tl.constexpr,
+    compute_type: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    USE_MX_NATIVE: tl.constexpr,
+):
+    tl.static_assert(SPLIT_K == 1, "SPLIT_K must be 1 for MXFP4 kernel")
+    tl.static_assert(
+        BLOCK_SIZE_K % 32 == 0,
+        "BLOCK_SIZE_K must be divisible by 32 for MXFP4 kernel",
+    )
+
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs = tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
+    if not naive_block_assignment:
+        offs_token_id = pid_m * BLOCK_SIZE_M + offs
+        offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
+    else:
+        offs_token = tl.where(
+            offs == 0,
+            pid_m,
+            num_valid_tokens,
+        )
+    offs_token = offs_token.to(tl.int64)
+    token_mask = offs_token < num_valid_tokens
+
+    off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    if off_experts == -1:
+        write_zeros_to_output(
+            c_ptr,
+            stride_cm,
+            stride_cn,
+            pid_n,
+            N,
+            offs_token,
+            token_mask,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            compute_type,
+        )
+        return
+
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    offs_k_packed = tl.arange(0, BLOCK_SIZE_K // 2)
+    offs_k_scale = tl.arange(0, BLOCK_SIZE_K // 32)
+
+    a_ptrs = a_ptr + (
+        offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
+    )
+    b_ptrs = (
+        b_ptr
+        + off_experts * stride_be
+        + offs_k_packed[:, None] * stride_bk
+        + offs_bn[None, :] * stride_bn
+    )
+
+    if HAS_BIAS:
+        bias_ptrs = b_bias_ptr + off_experts * stride_bbe + offs_bn * stride_bbn
+        bias = tl.load(bias_ptrs, mask=(offs_bn < N), other=0.0)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    k_blocks = tl.cdiv(K, BLOCK_SIZE_K)
+    for k in range(0, k_blocks):
+        k_base = k * BLOCK_SIZE_K
+        k_mask = offs_k[None, :] < (K - k_base)
+        a_mask = token_mask[:, None] & k_mask
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        packed_k_limit = (K - k_base) // 2
+        b_mask = offs_k_packed[:, None] < packed_k_limit
+        b_packed = tl.load(b_ptrs, mask=b_mask, other=0)
+        b_scale_ptrs = (
+            b_scale_ptr
+            + off_experts * stride_bse
+            + offs_bn[:, None] * stride_bsn
+            + (k * (BLOCK_SIZE_K // 32) + offs_k_scale[None, :]) * stride_bsk
+        )
+        k_scale_limit = tl.cdiv(K - k_base, 32)
+        b_scale_mask = (offs_bn[:, None] < N) & (offs_k_scale[None, :] < k_scale_limit)
+        b_scale = tl.load(b_scale_ptrs, mask=b_scale_mask, other=0).to(tl.uint8)
+
+        if USE_MX_NATIVE:
+            a_packed, a_scale = _mxfp4_quantize_block(
+                a, a_mask, DEQUANT_SCALE_ROUNDING_MODE=0
+            )
+            accumulator = tl.dot_scaled(
+                a_packed,
+                a_scale,
+                "e2m1",
+                b_packed,
+                b_scale,
+                "e2m1",
+                acc=accumulator,
+                fast_math=True,
+            )
+        else:
+            a_packed, a_scale = _mxfp4_quantize_block(
+                a, a_mask, DEQUANT_SCALE_ROUNDING_MODE=0
+            )
+            a_dequant = _mxfp4_upcast_block(a_packed, a_scale, compute_type)
+            b_dequant = _mxfp4_upcast_block(tl.trans(b_packed), b_scale, compute_type)
+            b_dequant = tl.trans(b_dequant)
+            b_dequant = tl.where(offs_bn[None, :] < N, b_dequant, 0)
+            accumulator = tl.dot(a_dequant, b_dequant, acc=accumulator)
+
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
+
+    if HAS_BIAS:
+        accumulator = accumulator + bias[None, :].to(tl.float32)
+
+    if MUL_ROUTED_WEIGHT:
+        moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
+        accumulator = accumulator * moe_weight[:, None]
+
+    accumulator = accumulator.to(compute_type)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, accumulator, mask=c_mask)
+
+
 # NOTE(zyongye): we can remove all the wna16 kernel
 # once we drop off sm75 support
 def invoke_fused_moe_wna16_cuda_kernel(
@@ -725,6 +1019,89 @@ def invoke_fused_moe_wna16_triton_kernel(
     )
 
 
+def invoke_fused_moe_mxfp4_triton_kernel(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    B_scale: torch.Tensor | None,
+    topk_weights: torch.Tensor | None,
+    sorted_token_ids: torch.Tensor | None,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    mul_routed_weight: bool,
+    top_k: int,
+    config: dict[str, Any],
+    compute_type: tl.dtype,
+    B_bias: torch.Tensor | None = None,
+):
+    assert topk_weights is not None or not mul_routed_weight
+    assert topk_weights is None or topk_weights.stride(1) == 1
+    assert sorted_token_ids is None or sorted_token_ids.stride(0) == 1
+
+    assert B_scale is not None
+
+    use_mxfp4_native = current_platform.supports_mx()
+
+    M = A.size(0)
+    num_tokens = M * top_k
+    if sorted_token_ids is not None:
+        EM = sorted_token_ids.size(0)
+        if A.size(0) < config["BLOCK_SIZE_M"]:
+            # optimize for small batch_size.
+            # We assume that top_ids of each token is unique,
+            # so num_valid_experts <= batch_size <= BLOCK_SIZE_M,
+            # and we can skip some invalid blocks.
+            EM = min(
+                sorted_token_ids.size(0), A.size(0) * top_k * config["BLOCK_SIZE_M"]
+            )
+    else:
+        EM = num_tokens * config["BLOCK_SIZE_M"]
+    grid = lambda META: (
+        triton.cdiv(EM, META["BLOCK_SIZE_M"])
+        * triton.cdiv(B.size(1), META["BLOCK_SIZE_N"]),
+    )
+    HAS_BIAS = B_bias is not None
+
+    config = config.copy()
+    config["SPLIT_K"] = 1
+    BLOCK_SIZE_K = config.pop("BLOCK_SIZE_K")
+    fused_moe_kernel_mxfp4[grid](
+        A,
+        B,
+        C,
+        B_bias,
+        B_scale,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        B.size(1),
+        B.size(2) * 2,
+        EM,
+        num_tokens,
+        A.stride(0),
+        A.stride(1),
+        B.stride(0),
+        B.stride(2),
+        B.stride(1),
+        C.stride(1),
+        C.stride(2),
+        B_scale.stride(0),
+        B_scale.stride(2),
+        B_scale.stride(1),
+        B_bias.stride(0) if B_bias is not None else 0,
+        B_bias.stride(1) if B_bias is not None else 0,
+        naive_block_assignment=(sorted_token_ids is None),
+        MUL_ROUTED_WEIGHT=mul_routed_weight,
+        top_k=top_k,
+        compute_type=compute_type,
+        HAS_BIAS=HAS_BIAS,
+        USE_MX_NATIVE=use_mxfp4_native,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        **config,
+    )
+
+
 def invoke_fused_moe_triton_kernel(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -855,6 +1232,7 @@ def dispatch_fused_moe_kernel(
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
+    use_mxfp4_w4a4: bool,
     per_channel_quant: bool,
     block_shape: list[int] | None = None,
     B_bias: torch.Tensor | None = None,
@@ -865,6 +1243,11 @@ def dispatch_fused_moe_kernel(
 
     M = A.size(0)
     num_tokens = M * top_k
+
+    if use_mxfp4_w4a4:
+        assert B_scale is not None
+        assert A_scale is None
+        assert block_shape is None
 
     if (use_int8_w8a16 or use_int4_w4a16) and (
         block_shape is not None and block_shape[1] > 0
@@ -913,7 +1296,23 @@ def dispatch_fused_moe_kernel(
             use_int4_w4a16,
             block_shape,
         )
-
+    elif use_mxfp4_w4a4:
+        invoke_fused_moe_mxfp4_triton_kernel(
+            A=A,
+            B=B,
+            C=C,
+            A_scale=A_scale,
+            B_scale=B_scale,
+            topk_weights=topk_weights,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            mul_routed_weight=mul_routed_weight,
+            top_k=top_k,
+            config=config,
+            compute_type=compute_type,
+            B_bias=B_bias,
+        )
     else:
         invoke_fused_moe_triton_kernel(
             A,
@@ -1633,7 +2032,10 @@ def fused_experts_impl(
     if use_int4_w4a16:
         assert hidden_states.size(1) // 2 == w1.size(2), "Hidden size mismatch"
     elif ocp_mx_scheme is not None:
-        if ocp_mx_scheme.startswith("w_mxfp4"):
+        if ocp_mx_scheme == "w_mxfp4_a_mxfp4":
+            # activation are dynamically quantized to mxfp4
+            assert hidden_states.dtype in [torch.float16, torch.bfloat16]
+        elif ocp_mx_scheme.startswith("w_mxfp4"):
             # 16bit activation and fp4x2 packed weight
             assert hidden_states.size(1) == w1.size(2) * 2, "hidden size mismatch"
         elif ocp_mx_scheme.startswith("w_mxfp6"):
@@ -1722,11 +2124,13 @@ def fused_experts_impl(
 
     out_hidden_states = hidden_states if inplace else torch.empty_like(hidden_states)
 
+    use_mxfp4_w4a4 = ocp_mx_scheme == "w_mxfp4_a_mxfp4"
     if ocp_mx_scheme is not None:
-        # TODO: On platforms for which `current_platform.supports_mx()` is True
-        # and for which we have a native OCP mx fused MOE kernel,
-        # this dequantization step should not be done.
-        if ocp_mx_scheme.startswith("w_mxfp4"):
+        # TODO: Weight dequants (emulation) to be refactored in #32120
+        if ocp_mx_scheme == "w_mxfp4_a_mxfp4":
+            # triton kernel takes mxfp4 weights in mxfp4 format, no need to dequantize.
+            pass
+        elif ocp_mx_scheme.startswith("w_mxfp4"):
             # Weight has to be dequantized for mxfp4 emulation.
             w1 = dequant_mxfp4(w1, w1_scale, hidden_states.dtype)
             w1_scale = None
@@ -1837,6 +2241,7 @@ def fused_experts_impl(
             use_int8_w8a8=use_int8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
             use_int4_w4a16=use_int4_w4a16,
+            use_mxfp4_w4a4=use_mxfp4_w4a4,
             per_channel_quant=per_channel_quant,
             block_shape=block_shape,
             B_bias=w1_bias,
@@ -1877,6 +2282,7 @@ def fused_experts_impl(
             use_int8_w8a8=use_int8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
             use_int4_w4a16=use_int4_w4a16,
+            use_mxfp4_w4a4=use_mxfp4_w4a4,
             per_channel_quant=per_channel_quant,
             block_shape=block_shape,
             B_bias=w2_bias,
