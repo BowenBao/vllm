@@ -81,7 +81,6 @@ def write_zeros_to_output(
 def _mxfp4_quantize_block(
     src_tensor,
     valid_mask,
-    DEQUANT_SCALE_ROUNDING_MODE: tl.constexpr,
 ):
     BLOCK_SIZE_OUT_DIM: tl.constexpr = src_tensor.shape[0]
     BLOCK_SIZE_QUANT_DIM: tl.constexpr = src_tensor.shape[1]
@@ -93,23 +92,27 @@ def _mxfp4_quantize_block(
 
     f32_tensor = src_tensor.to(tl.float32)
     abs_tensor = tl.abs(f32_tensor)
-    valid_mask_group = tl.reshape(
-        valid_mask, [BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_MX_SCALE, 32]
-    )
-    abs_tensor = tl.where(valid_mask_group, abs_tensor, -1.0)
+    abs_tensor = tl.where(valid_mask, abs_tensor, -1.0)  # Don't consider padding tensors in scale computation
     abs_tensor = tl.reshape(
         abs_tensor, [BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_MX_SCALE, 32]
     )
     max_val = tl.max(abs_tensor, axis=2, keep_dims=True)
-    has_valid = tl.max(valid_mask_group, axis=2, keep_dims=True)
-    max_val = tl.where(has_valid, max_val, 0.0)
-    dequant_scale = max_val / 6.0
-    if DEQUANT_SCALE_ROUNDING_MODE == 0:
-        dequant_scale_exponent = (
-            dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF
-        ) & 0x7F800000
-    else:
-        dequant_scale_exponent = dequant_scale.to(tl.uint32, bitcast=True) & 0x7F800000
+    eps = tl.where(max_val == 0.0, 2**(-126), 0.0)
+    max_val = max_val.to(tl.int32, bitcast=True)
+    max_val = (max_val + 0x200000).to(tl.uint32, bitcast=True) & 0x7F800000
+    max_val = max_val.to(tl.float32, bitcast=True)
+    scale_e8m0_unbiased = tl.log2(max_val + eps).floor() - 2
+    scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
+    dequant_scale_rounded = tl.exp2(scale_e8m0_unbiased)
+    dequant_scale_exponent = dequant_scale_rounded.to(tl.uint32, bitcast=True)
+
+    # dequant_scale = max_val / 6.0
+    # if DEQUANT_SCALE_ROUNDING_MODE == 0:
+    #     dequant_scale_exponent = (
+    #         dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF
+    #     ) & 0x7F800000
+    # else:
+    #     dequant_scale_exponent = dequant_scale.to(tl.uint32, bitcast=True) & 0x7F800000
     dequant_scale_rounded = dequant_scale_exponent.to(tl.float32, bitcast=True)
     quant_scale = tl.where(dequant_scale_rounded == 0, 0, 1.0 / dequant_scale_rounded)
 
@@ -122,22 +125,28 @@ def _mxfp4_quantize_block(
     dequant_scale_exponent = dequant_scale_exponent.reshape(
         [BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_MX_SCALE]
     )
+    dequant_scale_exponent = (dequant_scale_exponent >> 23).to(tl.uint8)
 
     quant_tensor = quant_tensor.to(tl.uint32, bitcast=True)
     signs = quant_tensor & 0x80000000
     exponents = (quant_tensor >> 23) & 0xFF
     mantissas = quant_tensor & 0x7FFFFF
 
+    # 0.25 <= x < 0.75 maps to 0.5, a denormal number
     E8_BIAS = 127
     E2_BIAS = 1
+    # Move implicit bit 1 at the beginning to mantissa for denormals
     adjusted_exponents = tl.core.sub(E8_BIAS, exponents + 1, sanitize_overflow=False)
     mantissas = tl.where(
         exponents < E8_BIAS,
         (0x400000 | (mantissas >> 1)) >> adjusted_exponents,
         mantissas,
     )
+    # For normal numbers, we change the bias from 127 to 1, and for subnormals, we keep exponent as 0.
     exponents = tl.maximum(exponents, E8_BIAS - E2_BIAS) - (E8_BIAS - E2_BIAS)
 
+    # Combine sign, exponent, and mantissa, while saturating
+    # rounding nearest with tie breaking up by adding +1 to one bit right of the LSB, then shift right
     e2m1_tmp = tl.minimum((((exponents << 2) | (mantissas >> 21)) + 1) >> 1, 0x7)
     e2m1_value = ((signs >> 28) | e2m1_tmp).to(tl.uint8)
 
@@ -147,7 +156,6 @@ def _mxfp4_quantize_block(
     evens, odds = tl.split(e2m1_value)
     out_tensor = evens | (odds << 4)
 
-    dequant_scale_exponent = (dequant_scale_exponent >> 23).to(tl.uint8)
     return out_tensor, dequant_scale_exponent
 
 
@@ -168,7 +176,7 @@ def _mxfp4_upcast_block(
     dst_bias: tl.constexpr = 127 if dst_dtype == tl.bfloat16 else 15
     dst_0p5: tl.constexpr = 16128 if dst_dtype == tl.bfloat16 else 0x3800
     dst_m_bits: tl.constexpr = 7 if dst_dtype == tl.bfloat16 else 10
-
+    # e2m1
     em0 = packed_tensor & 0x07
     em1 = packed_tensor & 0x70
     x0 = (em0.to(tl.uint16) << (dst_m_bits - 1)) | (
@@ -177,15 +185,21 @@ def _mxfp4_upcast_block(
     x1 = (em1.to(tl.uint16) << (dst_m_bits - 5)) | (
         (packed_tensor & 0x80).to(tl.uint16) << 8
     )
+    # Three cases:
+    # 1) x is normal and non-zero: Correct bias
     x0 = tl.where((em0 & 0x06) != 0, x0 + ((dst_bias - 1) << dst_m_bits), x0)
     x1 = tl.where((em1 & 0x60) != 0, x1 + ((dst_bias - 1) << dst_m_bits), x1)
+    # 2) x is subnormal (x == 0bs001 where s is the sign): Map to +-0.5 in the dst type
     x0 = tl.where(em0 == 0x01, dst_0p5 | (x0 & 0x8000), x0)
     x1 = tl.where(em1 == 0x10, dst_0p5 | (x1 & 0x8000), x1)
+    # 3) x is zero, do nothing
     dst_tensor = tl.interleave(x0, x1).to(dst_dtype, bitcast=True)
 
+    # Upcast the scale to the destination type.
     if dst_dtype == tl.bfloat16:
         dst_scale = (scale_tensor.to(tl.uint16) << 7).to(dst_dtype, bitcast=True)
     else:
+        tl.static_assert(dst_dtype == tl.float16)
         dst_scale = (scale_tensor.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
         dst_scale = dst_scale.to(tl.float16)
 
@@ -830,7 +844,7 @@ def fused_moe_kernel_mxfp4(
 
         if USE_MX_NATIVE:
             a_packed, a_scale = _mxfp4_quantize_block(
-                a, a_mask, DEQUANT_SCALE_ROUNDING_MODE=0
+                a, a_mask
             )
             accumulator = tl.dot_scaled(
                 a_packed,
@@ -844,7 +858,7 @@ def fused_moe_kernel_mxfp4(
             )
         else:
             a_packed, a_scale = _mxfp4_quantize_block(
-                a, a_mask, DEQUANT_SCALE_ROUNDING_MODE=0
+                a, a_mask
             )
             a_dequant = _mxfp4_upcast_block(a_packed, a_scale, compute_type)
             b_dequant = _mxfp4_upcast_block(tl.trans(b_packed), b_scale, compute_type)
@@ -1301,7 +1315,6 @@ def dispatch_fused_moe_kernel(
             A=A,
             B=B,
             C=C,
-            A_scale=A_scale,
             B_scale=B_scale,
             topk_weights=topk_weights,
             sorted_token_ids=sorted_token_ids,
