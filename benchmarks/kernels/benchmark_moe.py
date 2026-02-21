@@ -101,13 +101,29 @@ def benchmark_config(
     use_fp8_w8a8: bool,
     use_int8_w8a16: bool,
     use_int4_w4a16: bool = False,
+    use_mxfp4_w4a4: bool = False,
     num_iters: int = 100,
     block_quant_shape: list[int] = None,
     use_deep_gemm: bool = False,
 ) -> float:
     init_dtype = torch.float16 if use_fp8_w8a8 else dtype
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
-    if use_int4_w4a16:
+    if use_mxfp4_w4a4:
+        try:
+            from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
+        except Exception as exc:
+            raise RuntimeError(
+                "triton_kernels mxfp utilities are required for mxfp4_w4a4"
+            ) from exc
+        w1_fp = torch.randn(
+            num_experts, shard_intermediate_size, hidden_size, dtype=init_dtype
+        )
+        w2_fp = torch.randn(
+            num_experts, hidden_size, shard_intermediate_size // 2, dtype=init_dtype
+        )
+        w1, w1_scale = downcast_to_mxfp(w1_fp, torch.uint8, axis=-1)
+        w2, w2_scale = downcast_to_mxfp(w2_fp, torch.uint8, axis=-1)
+    elif use_int4_w4a16:
         # Int4 packed weights: 2 int4 values per uint8 byte
         # K dimension is packed (halved)
         intermediate_size = shard_intermediate_size // 2  # after silu_and_mul
@@ -161,8 +177,9 @@ def benchmark_config(
         )
     gating_output = torch.randn(num_iters, num_tokens, num_experts, dtype=torch.float32)
 
-    w1_scale = None
-    w2_scale = None
+    if not use_mxfp4_w4a4:
+        w1_scale = None
+        w2_scale = None
     a1_scale = None
     a2_scale = None
     if use_int4_w4a16:
@@ -223,12 +240,18 @@ def benchmark_config(
     def run():
         from vllm.model_executor.layers.fused_moe import override_config
 
-        if use_fp8_w8a8:
+        if use_mxfp4_w4a4:
+            quant_dtype = "mxfp4"
+            weight_dtype = "mxfp4"
+        elif use_fp8_w8a8:
             quant_dtype = torch.float8_e4m3fn
+            weight_dtype = None
         elif use_int8_w8a16:
             quant_dtype = torch.int8
+            weight_dtype = None
         else:
             quant_dtype = None
+            weight_dtype = None
 
         quant_config = FusedMoEQuantConfig.make(
             quant_dtype=quant_dtype,
@@ -237,7 +260,7 @@ def benchmark_config(
             a1_scale=a1_scale,
             a2_scale=a2_scale,
             block_shape=block_quant_shape,
-            weight_dtype="int4" if use_int4_w4a16 else None,
+            weight_dtype="int4" if use_int4_w4a16 else weight_dtype,
         )
 
         deep_gemm_experts = None
@@ -521,6 +544,7 @@ class BenchmarkWorker:
         use_fp8_w8a8: bool,
         use_int8_w8a16: bool,
         use_int4_w4a16: bool = False,
+        use_mxfp4_w4a4: bool = False,
         block_quant_shape: list[int] = None,
         use_deep_gemm: bool = False,
     ) -> tuple[dict[str, int], float]:
@@ -563,6 +587,7 @@ class BenchmarkWorker:
             use_fp8_w8a8,
             use_int8_w8a16,
             use_int4_w4a16=use_int4_w4a16,
+            use_mxfp4_w4a4=use_mxfp4_w4a4,
             num_iters=100,
             block_quant_shape=block_quant_shape,
             use_deep_gemm=use_deep_gemm,
@@ -580,6 +605,7 @@ class BenchmarkWorker:
         use_fp8_w8a8: bool,
         use_int8_w8a16: bool,
         use_int4_w4a16: bool,
+        use_mxfp4_w4a4: bool,
         search_space: list[dict[str, int]],
         block_quant_shape: list[int],
         use_deep_gemm: bool,
@@ -590,7 +616,9 @@ class BenchmarkWorker:
         best_config = None
         best_time = float("inf")
         if current_platform.is_rocm():
-            is_fp16 = not (use_fp8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
+            is_fp16 = not (
+                use_fp8_w8a8 or use_int8_w8a16 or use_int4_w4a16 or use_mxfp4_w4a4
+            )
             search_space = prune_rocm_search_space(
                 num_tokens,
                 shard_intermediate_size,
@@ -620,6 +648,7 @@ class BenchmarkWorker:
                         use_fp8_w8a8,
                         use_int8_w8a16,
                         use_int4_w4a16,
+                        use_mxfp4_w4a4=use_mxfp4_w4a4,
                         num_iters=20,
                         block_quant_shape=block_quant_shape,
                         use_deep_gemm=use_deep_gemm,
@@ -841,9 +870,10 @@ def main(args: argparse.Namespace):
     use_fp8_w8a8 = args.dtype == "fp8_w8a8"
     use_int8_w8a16 = args.dtype == "int8_w8a16"
     use_int4_w4a16 = args.dtype == "int4_w4a16"
+    use_mxfp4_w4a4 = args.dtype == "mxfp4_w4a4"
     block_quant_shape = get_weight_block_size_safety(config)
     if use_int4_w4a16:
-        group_size = get_quantization_group_size(config)
+        group_size = get_quantization_group_size(config) or 16
         if group_size is None:
             raise ValueError(
                 "Could not determine group_size from model config. "
@@ -854,6 +884,8 @@ def main(args: argparse.Namespace):
         # For int4_w4a16, block_shape = [0, group_size]
         # block_shape[0]=0 means no block quantization on N dimension
         block_quant_shape = [0, group_size]
+    if use_mxfp4_w4a4:
+        block_quant_shape = None
 
     if args.batch_size is None:
         batch_sizes = [
@@ -909,7 +941,9 @@ def main(args: argparse.Namespace):
     if args.tune:
         # int4_w4a16 weights are uint8-packed, not fp16; treat like fp8 for
         # search space generation (no matrix_instr_nonkdim/kpack exploration).
-        is_fp16 = not (use_fp8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
+        is_fp16 = not (
+            use_fp8_w8a8 or use_int8_w8a16 or use_int4_w4a16 or use_mxfp4_w4a4
+        )
         # For int4_w4a16, the group_size constraint on BLOCK_SIZE_K does not
         # apply: the gptq_awq kernel handles arbitrary BLOCK_SIZE_K regardless
         # of group_size. Skip block_quant_shape filtering to keep the full
@@ -941,6 +975,7 @@ def main(args: argparse.Namespace):
                     use_fp8_w8a8,
                     use_int8_w8a16,
                     use_int4_w4a16,
+                    use_mxfp4_w4a4,
                     search_space,
                     block_quant_shape,
                     use_deep_gemm,
@@ -980,6 +1015,7 @@ def main(args: argparse.Namespace):
                     use_fp8_w8a8,
                     use_int8_w8a16,
                     use_int4_w4a16,
+                    use_mxfp4_w4a4,
                     block_quant_shape,
                     use_deep_gemm,
                 )
@@ -1004,7 +1040,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dtype",
         type=str,
-        choices=["auto", "fp8_w8a8", "int8_w8a16", "int4_w4a16"],
+        choices=["auto", "fp8_w8a8", "int8_w8a16", "int4_w4a16", "mxfp4_w4a4"],
         default="auto",
     )
     parser.add_argument("--use-deep-gemm", action="store_true")

@@ -34,6 +34,8 @@ from vllm.model_executor.layers.fused_moe import (
 )
 from vllm.model_executor.layers.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
+    FusedMoEQuantConfig,
+    fp8_w8a8_moe_quant_config,
     int4_w4a16_moe_quant_config,
     int8_w8a16_moe_quant_config,
 )
@@ -41,6 +43,7 @@ from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
     batched_fused_marlin_moe,
     fused_marlin_moe,
 )
+from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     marlin_permute_bias,
 )
@@ -59,6 +62,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import quantize_w
 from vllm.model_executor.models.mixtral import MixtralMoE
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
+from vllm.utils.import_utils import has_triton_kernels
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.workspace import init_workspace_manager
 
@@ -1721,3 +1725,74 @@ def test_unquantized_bf16_flashinfer_trtllm_backend(
 
     close = torch.isclose(trtllm_output, baseline_output, atol=1e-1, rtol=0.85)
     assert close.float().mean() > 0.925
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(not has_triton_kernels(), reason="requires triton_kernels")
+@torch.inference_mode()
+def test_triton_mxfp4_w4a4_emulation_matches_baselines():
+    try:
+        from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
+    except Exception as exc:  # pragma: no cover - dependency guard
+        pytest.skip(f"triton_kernels mxfp utilities not available: {exc}")
+
+    torch.manual_seed(0)
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    M = 32
+    K = 64
+    E = 4
+    N = 32
+    topk = 2
+
+    hidden_states = (torch.randn((M, K), device=device, dtype=dtype) / 10).contiguous()
+    w1_fp = (torch.randn((E, 2 * N, K), device=device, dtype=dtype) / 10).contiguous()
+    w2_fp = (torch.randn((E, K, N), device=device, dtype=dtype) / 10).contiguous()
+
+    topk_ids = torch.randint(0, E, (M, topk), device=device, dtype=torch.int32)
+    topk_weights = torch.randn((M, topk), device=device, dtype=torch.float32)
+    topk_weights = torch.softmax(topk_weights, dim=1)
+
+    w1_mx, w1_scale = downcast_to_mxfp(w1_fp, torch.uint8, axis=-1)
+    w2_mx, w2_scale = downcast_to_mxfp(w2_fp, torch.uint8, axis=-1)
+    mxfp4_quant = FusedMoEQuantConfig.make(
+        quant_dtype="mxfp4",
+        weight_dtype="mxfp4",
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+    )
+
+    finfo = torch.finfo(torch.float8_e4m3fn)
+    fp8_max, fp8_min = finfo.max, finfo.min
+    w1_fp8 = (w1_fp.float() * fp8_max).clamp(fp8_min, fp8_max).to(torch.float8_e4m3fn)
+    w2_fp8 = (w2_fp.float() * fp8_max).clamp(fp8_min, fp8_max).to(torch.float8_e4m3fn)
+    w1_fp8_scale = torch.rand((E, 2 * N), device=device) * 1e-2
+    w2_fp8_scale = torch.rand((E, K), device=device) * 1e-2
+    fp8_quant = fp8_w8a8_moe_quant_config(
+        per_act_token_quant=True,
+        w1_scale=w1_fp8_scale,
+        w2_scale=w2_fp8_scale,
+        block_shape=None,
+    )
+
+    ref = fused_experts(hidden_states, w1_fp, w2_fp, topk_weights, topk_ids)
+    out_mxfp4 = fused_experts(
+        hidden_states, w1_mx, w2_mx, topk_weights, topk_ids, quant_config=mxfp4_quant
+    )
+    out_fp8 = fused_experts(
+        hidden_states, w1_fp8, w2_fp8, topk_weights, topk_ids, quant_config=fp8_quant
+    )
+
+    ref_f32 = ref.float()
+    mxfp4_err = torch.mean(torch.abs(out_mxfp4.float() - ref_f32)) / torch.mean(
+        torch.abs(ref_f32)
+    )
+    fp8_err = torch.mean(torch.abs(out_fp8.float() - ref_f32)) / torch.mean(
+        torch.abs(ref_f32)
+    )
+
+    assert torch.isfinite(out_mxfp4).all()
+    assert torch.isfinite(out_fp8).all()
+    assert mxfp4_err < 0.5
+    assert fp8_err < 0.3
