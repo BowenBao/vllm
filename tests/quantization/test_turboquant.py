@@ -2285,6 +2285,256 @@ class TestV1V3TightEquivalence:
 
 
 # ============================================================================
+# Approach 1b — v1 ↔ v3 tight equivalence ON the sink path
+# ============================================================================
+#
+# TestV1V3TightEquivalence above runs with sinks=None. Production gpt-oss
+# layers always pass sinks. Without a v1↔v3-with-sinks test we could not
+# tell whether a full-model accuracy gap (e.g. the GPQA v3 − v1 = -0.021
+# observed on gpt-oss-20b) comes from the sink port being subtly wrong or
+# from one of v3's non-sink features (SoA layout, norm-baking at store,
+# 3D split threshold, fused Q-rotation).
+#
+# This class is the unit-level bisection gate: if it passes, the sink
+# port is numerically equivalent to v1's on decode shapes including the
+# gpt-oss-20b geometry, and any e2e regression is attributable elsewhere.
+# If it fails, we have a localized v3 sink bug to fix.
+
+
+@pytest.mark.skipif(not GPGPU_AVAILABLE, reason="GPGPU not available")
+class TestV1V3SinkEquivalence:
+    """Tight v1 ↔ v3 decode equivalence with the sink path engaged.
+
+    Mirrors TestV1V3TightEquivalence's Tier-A magnitude gate but drives
+    both kernels through USE_SINKS=1 with the same per-head sink vector.
+    Since v1 and v3 implement the same init-time softmax-state trick
+    (M = s_h, L = 1.0 for the first segment; -inf/1.0 otherwise), a
+    correct v3 port must not expand the v1↔v3 drift envelope vs the
+    no-sink case.
+    """
+
+    _build_and_store = staticmethod(TestDecodeV2Equivalence._build_and_store)
+
+    @staticmethod
+    def _run_v1_v3_with_sinks(
+        cfg,
+        Pi,
+        PiT,
+        centroids,
+        kv_cache,
+        num_blocks,
+        B,
+        Hq,
+        D,
+        seq_len,
+        qseed,
+        query_dtype,
+        sinks,
+    ):
+        from vllm.v1.attention.ops.triton_turboquant_decode import (
+            triton_turboquant_decode_attention,
+        )
+        from vllm.v1.attention.ops.triton_turboquant_unified_attention import (
+            triton_turboquant_decode_attention_v3,
+        )
+
+        device = torch.device(DEVICE_TYPE)
+        torch.manual_seed(qseed)
+        query = torch.randn(B, Hq, D, device=device, dtype=query_dtype)
+        block_table = (
+            torch.arange(num_blocks, device=device, dtype=torch.int32)
+            .unsqueeze(0)
+            .expand(B, -1)
+            .contiguous()
+        )
+        seq_lens = torch.full((B,), seq_len, device=device, dtype=torch.int32)
+        common = dict(
+            query=query,
+            kv_cache=kv_cache,
+            block_table=block_table,
+            seq_lens=seq_lens,
+            Pi=Pi,
+            centroids=centroids,
+            scale=1.0 / math.sqrt(D),
+            mse_bits=cfg.key_mse_bits,
+            key_packed_size=cfg.key_packed_size,
+            value_quant_bits=cfg.effective_value_quant_bits,
+            key_fp8=cfg.key_fp8,
+            norm_correction=cfg.norm_correction,
+            PiT=PiT,
+            sinks=sinks,
+        )
+        out_v1 = triton_turboquant_decode_attention(**common, max_num_kv_splits=8)
+        out_v3 = triton_turboquant_decode_attention_v3(
+            **common, value_packed_size=cfg.value_packed_size
+        )
+        return out_v1, out_v3
+
+    # ------------------------------------------------------------------
+    # TIER A (sinks) — v3 must stay inside v1's Tier-A envelope when both
+    # are driven with the same per-head sink vector. Shapes include the
+    # gpt-oss-20b geometry (Hq=64, Hk=8, D=64) at a realistic context.
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "preset,B,Hq,Hk,D,seq_len,block_size",
+        [
+            ("turboquant_4bit_nc", 1, 4, 4, 128, 64, 16),
+            ("turboquant_4bit_nc", 4, 8, 2, 128, 2048, 64),
+            ("turboquant_4bit_nc", 2, 64, 8, 64, 512, 16),
+            ("turboquant_4bit_nc", 2, 64, 8, 64, 2048, 64),
+            ("turboquant_4bit_nc", 1, 64, 8, 64, 4096, 64),  # gpt-oss-like
+            ("turboquant_4bit_nc", 1, 64, 8, 64, 8192, 64),  # long ctx
+            ("turboquant_k8v4", 2, 64, 8, 64, 2048, 64),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "query_dtype",
+        [torch.float16, torch.bfloat16],
+        ids=["qfp16", "qbf16"],
+    )
+    @pytest.mark.parametrize(
+        "sink_scale",
+        [0.5, 2.0],
+        ids=["s05", "s20"],
+    )
+    def test_v1_v3_decode_sink_tight(
+        self, preset, B, Hq, Hk, D, seq_len, block_size, query_dtype, sink_scale
+    ):
+        cfg, Pi, PiT, centroids, kv_cache, num_blocks = self._build_and_store(
+            preset,
+            Hk=Hk,
+            D=D,
+            seq_len=seq_len,
+            block_size=block_size,
+            seed=4242,
+        )
+        device = torch.device(DEVICE_TYPE)
+        torch.manual_seed(9191)
+        # Per-head sinks in fp32, scaled to cover the realistic range for
+        # gpt-oss-20b-style models (learned logits typically O(1..3)).
+        sinks = torch.randn(Hq, device=device, dtype=torch.float32) * sink_scale
+
+        out_v1, out_v3 = self._run_v1_v3_with_sinks(
+            cfg,
+            Pi,
+            PiT,
+            centroids,
+            kv_cache,
+            num_blocks,
+            B=B,
+            Hq=Hq,
+            D=D,
+            seq_len=seq_len,
+            qseed=7777,
+            query_dtype=query_dtype,
+            sinks=sinks,
+        )
+        st = _drift_stats(out_v1, out_v3, seq_len)
+        cos_min, max_ceil, mean_ceil, p99_ceil, snr_ceil = _TIER_A_THRESHOLDS[
+            query_dtype
+        ]
+        tag = (
+            f"[SINK-A {preset} B={B} Hq={Hq} Hk={Hk} D={D} seq={seq_len} "
+            f"bs={block_size} sink×{sink_scale} "
+            f"{str(query_dtype).replace('torch.', '')}]"
+        )
+        assert st["cos_sim"] > cos_min, (
+            f"{tag} cos_sim={st['cos_sim']:.6f} <= {cos_min} "
+            f"(max_abs={st['max_abs']:.3e} mean_abs={st['mean_abs']:.3e})"
+        )
+        assert st["max_abs"] < max_ceil, (
+            f"{tag} max_abs={st['max_abs']:.3e} >= {max_ceil} "
+            f"(cos_sim={st['cos_sim']:.6f})"
+        )
+        assert st["mean_abs"] < mean_ceil, (
+            f"{tag} mean_abs={st['mean_abs']:.3e} >= {mean_ceil}"
+        )
+        assert st["p99_abs"] < p99_ceil, (
+            f"{tag} p99_abs={st['p99_abs']:.3e} >= {p99_ceil}"
+        )
+        assert st["snr"] < snr_ceil, (
+            f"{tag} |mean|/std={st['snr']:.4f} >= {snr_ceil} "
+            f"(drift looks biased, not noise-shaped)"
+        )
+
+    # ------------------------------------------------------------------
+    # TIER Z — extreme-negative sink degenerates to no-sink on both
+    # kernels, and v1 and v3 agree at the degenerate limit. This is a
+    # sanity guard: if v3 gets the USE_SINKS=1 path systematically wrong
+    # in a way that doesn't vanish at s_h -> -inf, Tier A might still
+    # pass (small-magnitude bug) while this gate exposes it.
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "preset,B,Hq,Hk,D,seq_len,block_size",
+        [
+            ("turboquant_4bit_nc", 2, 64, 8, 64, 2048, 64),
+            ("turboquant_4bit_nc", 1, 64, 8, 64, 4096, 64),
+        ],
+    )
+    def test_v1_v3_decode_sink_degenerate(
+        self, preset, B, Hq, Hk, D, seq_len, block_size
+    ):
+        cfg, Pi, PiT, centroids, kv_cache, num_blocks = self._build_and_store(
+            preset,
+            Hk=Hk,
+            D=D,
+            seq_len=seq_len,
+            block_size=block_size,
+            seed=4242,
+        )
+        device = torch.device(DEVICE_TYPE)
+        very_neg = torch.full((Hq,), -100.0, device=device, dtype=torch.float32)
+        out_v1_s, out_v3_s = self._run_v1_v3_with_sinks(
+            cfg,
+            Pi,
+            PiT,
+            centroids,
+            kv_cache,
+            num_blocks,
+            B=B,
+            Hq=Hq,
+            D=D,
+            seq_len=seq_len,
+            qseed=7777,
+            query_dtype=torch.float16,
+            sinks=very_neg,
+        )
+        out_v1_n, out_v3_n = self._run_v1_v3_with_sinks(
+            cfg,
+            Pi,
+            PiT,
+            centroids,
+            kv_cache,
+            num_blocks,
+            B=B,
+            Hq=Hq,
+            D=D,
+            seq_len=seq_len,
+            qseed=7777,
+            query_dtype=torch.float16,
+            sinks=None,
+        )
+        d_v1 = (out_v1_s.float() - out_v1_n.float()).abs().max().item()
+        d_v3 = (out_v3_s.float() - out_v3_n.float()).abs().max().item()
+        d_v1v3 = (out_v1_s.float() - out_v3_s.float()).abs().max().item()
+        tag = (
+            f"[SINK-Z {preset} B={B} Hq={Hq} Hk={Hk} D={D} seq={seq_len} "
+            f"bs={block_size}]"
+        )
+        # exp(-100 - M) underflows to 0 in fp32 for any realistic score,
+        # so s_h = -100 must be numerically identical to sinks=None.
+        assert d_v1 == 0.0, f"{tag} v1 sink=-100 vs sinks=None |d|={d_v1:.3e}"
+        assert d_v3 == 0.0, f"{tag} v3 sink=-100 vs sinks=None |d|={d_v3:.3e}"
+        # And v1↔v3 must stay inside the fp16 Tier-A max_abs ceiling.
+        max_abs_ceil = _TIER_A_THRESHOLDS[torch.float16][1]
+        assert d_v1v3 < max_abs_ceil, (
+            f"{tag} v1 vs v3 (sink=-100) |d|={d_v1v3:.3e} >= {max_abs_ceil}"
+        )
+
+
+# ============================================================================
 # Approach 2 — v3 vs FP32 reference attention (quantization-budget gate)
 # ============================================================================
 #
@@ -2801,4 +3051,718 @@ class TestV3VsReference:
         assert worst >= thr, (
             f"{tag} worst cos_p5 across 5 seeds = {worst:.5f} < {thr} "
             f"(all seeds: {[round(v, 5) for v in cos_p5_per_seed]})"
+        )
+
+
+# ============================================================================
+# Approach 3 — v3 sink coverage (beyond v1↔v3 relative equivalence)
+# ============================================================================
+#
+# TestV1V3SinkEquivalence gates v3 ≈ v1 with sinks at Tier-A BF16-ULP tightness,
+# but that only proves the two kernels drift the same amount *together* — they
+# could both be systematically wrong in the same direction. The gates below
+# close the remaining coverage holes for the v3 sink port:
+#
+#   * TestV3TwoDThreeDSinkEquivalence  — 2D vs 3D split-KV paths with sinks
+#     engaged. v1 has no 3D path, so v1↔v3 cannot exercise the new
+#     ``if USE_SINKS and segm_idx == 0`` branch in the 3D reducer.
+#   * TestV3SinksVsReference           — v3 decode + prefill with sinks vs
+#     an fp32 oracle that folds the sink into the softmax denominator.
+#     This is *absolute* correctness (catches directionless bugs the v1↔v3
+#     relative gate cannot). Prefill has no v1 analog — v1 uses flash-attn
+#     for the first chunk — so this is the only numerical gate on v3's
+#     unified 2D-kernel prefill path with sinks.
+#   * TestV3MixedBatchSinks            — mixed prefill+decode batches with
+#     sinks. Exercises per-seq indexing in production workloads.
+
+
+def _fp32_attn_with_sinks(query, raw_k, raw_v, scale, sinks):
+    """Decode-only fp32 oracle with per-head sinks folded into the softmax.
+
+    Folds a per-head sink logit ``s_h`` into the softmax denominator by
+    appending it as an extra score column, softmax'ing over ``S+1`` entries,
+    and then reading only the first ``S`` columns of the probs (the sink
+    has no V vector, so its probability mass drops out of the output).
+
+    Matches the kernel's init-time softmax state trick exactly:
+    ``out_h = Σ_i exp(q·k_i) V_i / (exp(s_h) + Σ_j exp(q·k_j))``.
+    """
+    Hq = query.shape[1]
+    Hk = raw_k.shape[1]
+    group = Hq // Hk
+    k = raw_k.float().repeat_interleave(group, dim=1)
+    v = raw_v.float().repeat_interleave(group, dim=1)
+    q_f = query.float()
+    scores = torch.einsum("bhd,shd->bhs", q_f, k) * scale
+    sinks_b = sinks.float().view(1, Hq, 1).expand(scores.shape[0], -1, -1)
+    scores_ext = torch.cat([scores, sinks_b], dim=-1)
+    probs_ext = torch.softmax(scores_ext, dim=-1)
+    probs = probs_ext[..., :-1]
+    return torch.einsum("bhs,shd->bhd", probs, v)
+
+
+def _fp32_prefill_with_sinks(query, raw_k, raw_v, B, Q, seq_len, scale, sinks):
+    """Prefill fp32 oracle with per-head sinks + causal mask.
+
+    ``query`` is ``[B*Q, Hq, D]`` (packed). All ``B`` seqs share the same KV
+    cache of length ``seq_len``; each attends causally to ``[0, C+i]`` where
+    ``C = seq_len - Q`` and ``i`` is the within-seq query position.
+    """
+    Hq = query.shape[1]
+    Hk = raw_k.shape[1]
+    group = Hq // Hk
+    C = seq_len - Q
+    k = raw_k.float().repeat_interleave(group, dim=1)
+    v = raw_v.float().repeat_interleave(group, dim=1)
+    sinks_f = sinks.float()
+    out = []
+    for b in range(B):
+        q_f = query[b * Q : (b + 1) * Q].float()
+        scores = torch.einsum("qhd,shd->qhs", q_f, k) * scale
+        q_pos = torch.arange(Q, device=scores.device) + C
+        k_pos = torch.arange(seq_len, device=scores.device)
+        mask = k_pos[None, :] > q_pos[:, None]
+        scores = scores.masked_fill(mask[:, None, :], float("-inf"))
+        sinks_ext = sinks_f.view(1, Hq, 1).expand(Q, -1, -1)
+        scores_ext = torch.cat([scores, sinks_ext], dim=-1)
+        probs_ext = torch.softmax(scores_ext, dim=-1)
+        probs = probs_ext[..., :-1]
+        out.append(torch.einsum("qhs,shd->qhd", probs, v))
+    return torch.cat(out, dim=0)
+
+
+def _fp32_oracle_per_seq_sinks(
+    queries_per_seq, raw_k, raw_v, seq_lens_list, scale, sinks
+):
+    """Per-seq fp32 oracle with sinks for mixed-batch prefill/decode."""
+    Hk = raw_k.shape[1]
+    sinks_f = sinks.float()
+    outs = []
+    for q, Si in zip(queries_per_seq, seq_lens_list):
+        Qi, Hq_, _ = q.shape
+        Ci = Si - Qi
+        group = Hq_ // Hk
+        k = raw_k[:Si].float().repeat_interleave(group, dim=1)
+        v = raw_v[:Si].float().repeat_interleave(group, dim=1)
+        s = torch.einsum("qhd,shd->qhs", q.float(), k) * scale
+        q_pos = torch.arange(Qi, device=q.device) + Ci
+        k_pos = torch.arange(Si, device=q.device)
+        mask = k_pos[None, :] > q_pos[:, None]
+        s = s.masked_fill(mask[:, None, :], float("-inf"))
+        sinks_ext = sinks_f.view(1, Hq_, 1).expand(Qi, -1, -1)
+        s_ext = torch.cat([s, sinks_ext], dim=-1)
+        probs_ext = torch.softmax(s_ext, dim=-1)
+        probs = probs_ext[..., :-1]
+        outs.append(torch.einsum("qhs,shd->qhd", probs, v))
+    return torch.cat(outs, dim=0)
+
+
+@pytest.mark.skipif(not GPGPU_AVAILABLE, reason="GPGPU not available")
+class TestV3TwoDThreeDSinkEquivalence:
+    """2D vs 3D split-KV kernel equivalence with sinks engaged.
+
+    Mirrors ``TestV3TwoDThreeDEquivalence`` but drives both paths through
+    ``USE_SINKS=1`` with the same per-head sink vector. This gates the new
+    ``if USE_SINKS and segm_idx == 0`` branch in the 3D reducer
+    (``triton_turboquant_unified_attention.py`` ~L709) — a branch that has
+    no v1 analog and therefore cannot be covered by the v1↔v3 relative
+    equivalence gate.
+    """
+
+    _build_and_store = staticmethod(TestDecodeV2Equivalence._build_and_store)
+
+    @staticmethod
+    def _run_v3(
+        cfg,
+        Pi,
+        PiT,
+        centroids,
+        kv_cache,
+        num_blocks,
+        B,
+        Hq,
+        D,
+        seq_len,
+        qseed,
+        force_2d,
+        sinks,
+    ):
+        from vllm.v1.attention.ops.triton_turboquant_unified_attention import (
+            triton_turboquant_unified_attention,
+        )
+
+        device = torch.device(DEVICE_TYPE)
+        torch.manual_seed(qseed)
+        query = torch.randn(B, Hq, D, device=device, dtype=torch.float16)
+        block_table = (
+            torch.arange(num_blocks, device=device, dtype=torch.int32)
+            .unsqueeze(0)
+            .expand(B, -1)
+            .contiguous()
+        )
+        seq_lens = torch.full((B,), seq_len, device=device, dtype=torch.int32)
+        query_start_loc = torch.arange(B + 1, device=device, dtype=torch.int32) * 1
+        return triton_turboquant_unified_attention(
+            query=query,
+            kv_cache=kv_cache,
+            block_table=block_table,
+            seq_lens=seq_lens,
+            query_start_loc=query_start_loc,
+            Pi=Pi,
+            centroids=centroids,
+            scale=1.0 / math.sqrt(D),
+            mse_bits=cfg.key_mse_bits,
+            key_packed_size=cfg.key_packed_size,
+            value_quant_bits=cfg.effective_value_quant_bits,
+            value_packed_size=cfg.value_packed_size,
+            key_fp8=cfg.key_fp8,
+            norm_correction=cfg.norm_correction,
+            PiT=PiT,
+            max_query_len=1,
+            max_seq_len=seq_len,
+            force_2d=force_2d,
+            sinks=sinks,
+        )
+
+    @pytest.mark.parametrize(
+        "preset,B,Hq,Hk,D,seq_len",
+        [
+            ("turboquant_4bit_nc", 1, 64, 8, 64, 1024),
+            ("turboquant_4bit_nc", 1, 64, 8, 64, 2048),
+            ("turboquant_4bit_nc", 4, 64, 8, 64, 2048),
+            ("turboquant_4bit_nc", 1, 32, 4, 128, 1024),
+            ("turboquant_4bit_nc", 1, 64, 8, 64, 4096),
+            ("turboquant_k8v4", 1, 64, 8, 64, 2048),
+        ],
+    )
+    def test_2d_3d_equivalent_with_sinks(self, preset, B, Hq, Hk, D, seq_len):
+        cfg, Pi, PiT, centroids, kv_cache, num_blocks = self._build_and_store(
+            preset, Hk=Hk, D=D, seq_len=seq_len, block_size=16, seed=4242
+        )
+        device = torch.device(DEVICE_TYPE)
+        torch.manual_seed(9191)
+        # Realistic gpt-oss-ish sink magnitude (learned logits O(1..3)).
+        sinks = torch.randn(Hq, device=device, dtype=torch.float32) * 1.5
+
+        out_2d = self._run_v3(
+            cfg,
+            Pi,
+            PiT,
+            centroids,
+            kv_cache,
+            num_blocks,
+            B=B,
+            Hq=Hq,
+            D=D,
+            seq_len=seq_len,
+            qseed=7777,
+            force_2d=True,
+            sinks=sinks,
+        )
+        out_3d = self._run_v3(
+            cfg,
+            Pi,
+            PiT,
+            centroids,
+            kv_cache,
+            num_blocks,
+            B=B,
+            Hq=Hq,
+            D=D,
+            seq_len=seq_len,
+            qseed=7777,
+            force_2d=False,
+            sinks=sinks,
+        )
+        diff = (out_2d.float() - out_3d.float()).abs()
+        max_d, mean_d = diff.max().item(), diff.mean().item()
+        cos = torch.nn.functional.cosine_similarity(
+            out_2d.float().flatten().unsqueeze(0),
+            out_3d.float().flatten().unsqueeze(0),
+        ).item()
+        tag = f"[2D-vs-3D-sinks {preset} B={B} Hq={Hq} Hk={Hk} D={D} seq={seq_len}]"
+        # Same fp32-reassociation envelope as the no-sink 2D↔3D gate. The
+        # sink-init branch is a pure additive state change — it cannot widen
+        # the reassociation gap between 2D and 3D, so these thresholds still
+        # hold. Any failure here points at the 3D segment-reducer handling
+        # the sink-seeded (M, L) state incorrectly.
+        assert max_d < 5e-3, f"{tag} max_d={max_d:.4e}"
+        assert mean_d < 5e-4, f"{tag} mean_d={mean_d:.4e}"
+        assert cos > 0.99999, f"{tag} cos={cos:.8f}"
+
+
+@pytest.mark.skipif(not GPGPU_AVAILABLE, reason="GPGPU not available")
+class TestV3SinksVsReference:
+    """v3 decode + prefill with sinks vs fp32 oracle (absolute accuracy).
+
+    v1↔v3 relative equivalence (TestV1V3SinkEquivalence) alone does not
+    prove correctness — both kernels could drift the same direction. This
+    class gates v3 against a ground-truth fp32 oracle that computes the
+    canonical sink-in-denominator softmax
+    ``p_i = exp(q·k_i) / (exp(s_h) + Σ_j exp(q·k_j))`` directly.
+
+    Prefill is especially important here: v1 has no prefill kernel (it
+    uses flash-attn for the first chunk), so v3's 2D-kernel prefill path
+    with sinks has **no** v1 analog and has not been numerically gated
+    until this class existed.
+
+    Thresholds reuse ``_BUDGET_4BIT_NC_{DECODE,PREFILL}`` — sinks shrink
+    output magnitude without changing per-slot direction, so cos/relerr
+    stays inside the no-sink budget (sinks only dampen, they don't tilt).
+    """
+
+    _build_and_store_return_raw = staticmethod(
+        TestDecodeV2Equivalence._build_and_store_return_raw
+    )
+
+    @staticmethod
+    def _run_v3_decode(
+        cfg,
+        Pi,
+        PiT,
+        centroids,
+        kv_cache,
+        num_blocks,
+        B,
+        Hq,
+        D,
+        seq_len,
+        qseed,
+        sinks,
+    ):
+        from vllm.v1.attention.ops.triton_turboquant_unified_attention import (
+            triton_turboquant_decode_attention_v3,
+        )
+
+        device = torch.device(DEVICE_TYPE)
+        torch.manual_seed(qseed)
+        query = torch.randn(B, Hq, D, device=device, dtype=torch.float16)
+        block_table = (
+            torch.arange(num_blocks, device=device, dtype=torch.int32)
+            .unsqueeze(0)
+            .expand(B, -1)
+            .contiguous()
+        )
+        seq_lens = torch.full((B,), seq_len, device=device, dtype=torch.int32)
+        out = triton_turboquant_decode_attention_v3(
+            query=query,
+            kv_cache=kv_cache,
+            block_table=block_table,
+            seq_lens=seq_lens,
+            Pi=Pi,
+            centroids=centroids,
+            scale=1.0 / math.sqrt(D),
+            mse_bits=cfg.key_mse_bits,
+            key_packed_size=cfg.key_packed_size,
+            value_quant_bits=cfg.effective_value_quant_bits,
+            value_packed_size=cfg.value_packed_size,
+            key_fp8=cfg.key_fp8,
+            norm_correction=cfg.norm_correction,
+            PiT=PiT,
+            sinks=sinks,
+        )
+        return query, out
+
+    @staticmethod
+    def _run_v3_prefill(
+        cfg,
+        Pi,
+        PiT,
+        centroids,
+        kv_cache,
+        num_blocks,
+        B,
+        Hq,
+        D,
+        seq_len,
+        Q,
+        qseed,
+        sinks,
+    ):
+        from vllm.v1.attention.ops.triton_turboquant_unified_attention import (
+            triton_turboquant_unified_attention,
+        )
+
+        device = torch.device(DEVICE_TYPE)
+        torch.manual_seed(qseed)
+        query = torch.randn(B * Q, Hq, D, device=device, dtype=torch.float16)
+        block_table = (
+            torch.arange(num_blocks, device=device, dtype=torch.int32)
+            .unsqueeze(0)
+            .expand(B, -1)
+            .contiguous()
+        )
+        query_start_loc = torch.arange(B + 1, device=device, dtype=torch.int32) * Q
+        seq_lens = torch.full((B,), seq_len, device=device, dtype=torch.int32)
+        out = triton_turboquant_unified_attention(
+            query=query,
+            kv_cache=kv_cache,
+            block_table=block_table,
+            seq_lens=seq_lens,
+            query_start_loc=query_start_loc,
+            Pi=Pi,
+            centroids=centroids,
+            scale=1.0 / math.sqrt(D),
+            mse_bits=cfg.key_mse_bits,
+            key_packed_size=cfg.key_packed_size,
+            value_quant_bits=cfg.effective_value_quant_bits,
+            value_packed_size=cfg.value_packed_size,
+            key_fp8=cfg.key_fp8,
+            norm_correction=cfg.norm_correction,
+            PiT=PiT,
+            max_query_len=Q,
+            max_seq_len=seq_len,
+            sinks=sinks,
+        )
+        return query, out
+
+    # Reuse _ALPHA_SHAPES from TestV3VsReference for a matched sweep.
+    _ALPHA_SHAPES_SINKS = [
+        (2, 64, 8, 64, 256),
+        (2, 64, 8, 64, 1024),
+        (2, 64, 8, 64, 4096),
+        (2, 32, 4, 128, 256),
+        (2, 32, 4, 128, 1024),
+        (2, 32, 4, 128, 4096),
+    ]
+
+    @pytest.mark.parametrize(
+        "B,Hq,Hk,D,seq_len",
+        _ALPHA_SHAPES_SINKS,
+        ids=[f"B{B}Hq{Hq}Hk{Hk}D{D}S{S}" for (B, Hq, Hk, D, S) in _ALPHA_SHAPES_SINKS],
+    )
+    def test_v3_decode_sinks_per_query_budget(self, B, Hq, Hk, D, seq_len):
+        (cfg, Pi, PiT, centroids, kv_cache, num_blocks, raw_k, raw_v) = (
+            self._build_and_store_return_raw(
+                "turboquant_4bit_nc",
+                Hk=Hk,
+                D=D,
+                seq_len=seq_len,
+                block_size=16,
+                seed=4242,
+            )
+        )
+        device = torch.device(DEVICE_TYPE)
+        torch.manual_seed(9191)
+        sinks = torch.randn(Hq, device=device, dtype=torch.float32) * 1.5
+        query, out = self._run_v3_decode(
+            cfg,
+            Pi,
+            PiT,
+            centroids,
+            kv_cache,
+            num_blocks,
+            B=B,
+            Hq=Hq,
+            D=D,
+            seq_len=seq_len,
+            qseed=7777,
+            sinks=sinks,
+        )
+        ref = _fp32_attn_with_sinks(
+            query,
+            raw_k,
+            raw_v,
+            scale=1.0 / math.sqrt(D),
+            sinks=sinks,
+        )
+        st = _per_bh_metrics(out, ref)
+        b = _BUDGET_4BIT_NC_DECODE
+        tag = (
+            f"[α-decode-sinks B={B} Hq={Hq} Hk={Hk} D={D} seq={seq_len} "
+            f"N_slots={st['n_slots']}]"
+        )
+        assert st["cos_p5"] >= b["cos_p5_min"], (
+            f"{tag} cos_p5={st['cos_p5']:.5f} < {b['cos_p5_min']} "
+            f"(cos_min={st['cos_min']:.5f}, cos_mean={st['cos_mean']:.5f})"
+        )
+        assert st["cos_min"] >= b["cos_min_min"], (
+            f"{tag} cos_min={st['cos_min']:.5f} < {b['cos_min_min']}"
+        )
+        assert st["relerr_max"] <= b["relerr_max"], (
+            f"{tag} relerr_max={st['relerr_max']:.4f} > {b['relerr_max']}"
+        )
+        assert st["abs_max"] <= b["abs_max"], (
+            f"{tag} abs_max={st['abs_max']:.4f} > {b['abs_max']}"
+        )
+
+    @pytest.mark.parametrize(
+        "B,Hq,Hk,D,seq_len",
+        _ALPHA_SHAPES_SINKS,
+        ids=[f"B{B}Hq{Hq}Hk{Hk}D{D}S{S}" for (B, Hq, Hk, D, S) in _ALPHA_SHAPES_SINKS],
+    )
+    def test_v3_prefill_sinks_per_query_budget(self, B, Hq, Hk, D, seq_len):
+        Q = seq_len // 4
+        (cfg, Pi, PiT, centroids, kv_cache, num_blocks, raw_k, raw_v) = (
+            self._build_and_store_return_raw(
+                "turboquant_4bit_nc",
+                Hk=Hk,
+                D=D,
+                seq_len=seq_len,
+                block_size=16,
+                seed=4242,
+            )
+        )
+        device = torch.device(DEVICE_TYPE)
+        torch.manual_seed(9191)
+        sinks = torch.randn(Hq, device=device, dtype=torch.float32) * 1.5
+        query, out = self._run_v3_prefill(
+            cfg,
+            Pi,
+            PiT,
+            centroids,
+            kv_cache,
+            num_blocks,
+            B=B,
+            Hq=Hq,
+            D=D,
+            seq_len=seq_len,
+            Q=Q,
+            qseed=7777,
+            sinks=sinks,
+        )
+        ref = _fp32_prefill_with_sinks(
+            query,
+            raw_k,
+            raw_v,
+            B=B,
+            Q=Q,
+            seq_len=seq_len,
+            scale=1.0 / math.sqrt(D),
+            sinks=sinks,
+        )
+        st = _per_bh_metrics(out, ref)
+        b = _BUDGET_4BIT_NC_PREFILL
+        tag = (
+            f"[α-prefill-sinks B={B} Hq={Hq} Hk={Hk} D={D} seq={seq_len} "
+            f"Q={Q} N_slots={st['n_slots']}]"
+        )
+        assert st["cos_p5"] >= b["cos_p5_min"], (
+            f"{tag} cos_p5={st['cos_p5']:.5f} < {b['cos_p5_min']} "
+            f"(cos_min={st['cos_min']:.5f}, cos_mean={st['cos_mean']:.5f})"
+        )
+        assert st["cos_min"] >= b["cos_min_min"], (
+            f"{tag} cos_min={st['cos_min']:.5f} < {b['cos_min_min']}"
+        )
+        assert st["relerr_max"] <= b["relerr_max"], (
+            f"{tag} relerr_max={st['relerr_max']:.4f} > {b['relerr_max']}"
+        )
+        assert st["abs_max"] <= b["abs_max"], (
+            f"{tag} abs_max={st['abs_max']:.4f} > {b['abs_max']}"
+        )
+
+
+@pytest.mark.skipif(not GPGPU_AVAILABLE, reason="GPGPU not available")
+class TestV3MixedBatchSinks:
+    """Mixed-batch correctness with sinks engaged — production traffic shape.
+
+    Serving interleaves sequences of different lengths in one launch, and
+    gpt-oss passes a ``sinks`` tensor on every layer. If v3's per-seq
+    indexing (query_start_loc / seq_lens lookup) interacts incorrectly
+    with the sink-init softmax state, it will only surface when both
+    conditions apply at once.
+    """
+
+    _build_and_store_return_raw = staticmethod(
+        TestDecodeV2Equivalence._build_and_store_return_raw
+    )
+
+    @staticmethod
+    def _run_v3_mixed(
+        cfg,
+        Pi,
+        PiT,
+        centroids,
+        kv_cache,
+        num_blocks,
+        queries_per_seq,
+        seq_lens_list,
+        D,
+        qseed,
+        sinks,
+    ):
+        from vllm.v1.attention.ops.triton_turboquant_unified_attention import (
+            triton_turboquant_unified_attention,
+        )
+
+        device = torch.device(DEVICE_TYPE)
+        B = len(seq_lens_list)
+        qs = torch.cat(queries_per_seq, dim=0).contiguous()
+        block_table = (
+            torch.arange(num_blocks, device=device, dtype=torch.int32)
+            .unsqueeze(0)
+            .expand(B, -1)
+            .contiguous()
+        )
+        Q_per = torch.tensor(
+            [q.shape[0] for q in queries_per_seq],
+            device=device,
+            dtype=torch.int32,
+        )
+        query_start_loc = torch.cat(
+            [
+                torch.zeros(1, device=device, dtype=torch.int32),
+                torch.cumsum(Q_per, dim=0).to(torch.int32),
+            ]
+        )
+        seq_lens = torch.tensor(
+            seq_lens_list,
+            device=device,
+            dtype=torch.int32,
+        )
+        max_q = int(Q_per.max().item())
+        max_s = int(max(seq_lens_list))
+        return triton_turboquant_unified_attention(
+            query=qs,
+            kv_cache=kv_cache,
+            block_table=block_table,
+            seq_lens=seq_lens,
+            query_start_loc=query_start_loc,
+            Pi=Pi,
+            centroids=centroids,
+            scale=1.0 / math.sqrt(D),
+            mse_bits=cfg.key_mse_bits,
+            key_packed_size=cfg.key_packed_size,
+            value_quant_bits=cfg.effective_value_quant_bits,
+            value_packed_size=cfg.value_packed_size,
+            key_fp8=cfg.key_fp8,
+            norm_correction=cfg.norm_correction,
+            PiT=PiT,
+            max_query_len=max_q,
+            max_seq_len=max_s,
+            sinks=sinks,
+        )
+
+    @pytest.mark.parametrize(
+        "preset,Hq,Hk,D,seq_lens_list",
+        [
+            ("turboquant_4bit_nc", 64, 8, 64, [256, 1024, 512]),
+            ("turboquant_4bit_nc", 64, 8, 64, [1024, 2048, 4096, 1024]),
+            ("turboquant_4bit_nc", 32, 4, 128, [512, 1024, 2048]),
+            ("turboquant_k8v4", 64, 8, 64, [2048, 1024]),
+        ],
+    )
+    def test_mixed_batch_decode_sinks(self, preset, Hq, Hk, D, seq_lens_list):
+        max_seq = max(seq_lens_list)
+        (cfg, Pi, PiT, centroids, kv_cache, num_blocks, raw_k, raw_v) = (
+            self._build_and_store_return_raw(
+                preset,
+                Hk=Hk,
+                D=D,
+                seq_len=max_seq,
+                block_size=16,
+                seed=4242,
+            )
+        )
+        device = torch.device(DEVICE_TYPE)
+        torch.manual_seed(7777)
+        queries_per_seq = [
+            torch.randn(1, Hq, D, device=device, dtype=torch.float16)
+            for _ in seq_lens_list
+        ]
+        torch.manual_seed(9191)
+        sinks = torch.randn(Hq, device=device, dtype=torch.float32) * 1.5
+
+        out_v3 = self._run_v3_mixed(
+            cfg,
+            Pi,
+            PiT,
+            centroids,
+            kv_cache,
+            num_blocks,
+            queries_per_seq,
+            seq_lens_list,
+            D=D,
+            qseed=7777,
+            sinks=sinks,
+        )
+        ref = _fp32_oracle_per_seq_sinks(
+            queries_per_seq,
+            raw_k,
+            raw_v,
+            seq_lens_list,
+            scale=1.0 / math.sqrt(D),
+            sinks=sinks,
+        )
+        err = (out_v3.float() - ref).abs()
+        max_err, mean_err = err.max().item(), err.mean().item()
+        cos = torch.nn.functional.cosine_similarity(
+            out_v3.float().flatten().unsqueeze(0),
+            ref.flatten().unsqueeze(0),
+        ).item()
+        tag = (
+            f"[mixed-decode-sinks {preset} Hq={Hq} Hk={Hk} D={D} seqs={seq_lens_list}]"
+        )
+        # Same TQ-budget ceilings as the no-sink mixed-batch test — sinks
+        # only scale output magnitude down, they don't widen quant noise.
+        assert max_err < 1.5, f"{tag} max_err={max_err:.3f}"
+        assert mean_err < 0.05, f"{tag} mean_err={mean_err:.4f}"
+        assert cos > 0.98, (
+            f"{tag} cos={cos:.4f} (max_err={max_err:.4f} mean_err={mean_err:.4f})"
+        )
+
+    @pytest.mark.parametrize(
+        "preset,Hq,Hk,D,Q_seq_pairs",
+        [
+            ("turboquant_4bit_nc", 64, 8, 64, [(64, 256), (128, 512), (256, 1024)]),
+            ("turboquant_4bit_nc", 32, 4, 128, [(128, 512), (64, 1024)]),
+            ("turboquant_k8v4", 64, 8, 64, [(128, 512), (256, 1024)]),
+        ],
+    )
+    def test_mixed_batch_prefill_sinks(self, preset, Hq, Hk, D, Q_seq_pairs):
+        seq_lens_list = [s for _, s in Q_seq_pairs]
+        q_list = [q for q, _ in Q_seq_pairs]
+        max_seq = max(seq_lens_list)
+        (cfg, Pi, PiT, centroids, kv_cache, num_blocks, raw_k, raw_v) = (
+            self._build_and_store_return_raw(
+                preset,
+                Hk=Hk,
+                D=D,
+                seq_len=max_seq,
+                block_size=16,
+                seed=4242,
+            )
+        )
+        device = torch.device(DEVICE_TYPE)
+        torch.manual_seed(7777)
+        queries_per_seq = [
+            torch.randn(q, Hq, D, device=device, dtype=torch.float16) for q in q_list
+        ]
+        torch.manual_seed(9191)
+        sinks = torch.randn(Hq, device=device, dtype=torch.float32) * 1.5
+
+        out_v3 = self._run_v3_mixed(
+            cfg,
+            Pi,
+            PiT,
+            centroids,
+            kv_cache,
+            num_blocks,
+            queries_per_seq,
+            seq_lens_list,
+            D=D,
+            qseed=7777,
+            sinks=sinks,
+        )
+        ref = _fp32_oracle_per_seq_sinks(
+            queries_per_seq,
+            raw_k,
+            raw_v,
+            seq_lens_list,
+            scale=1.0 / math.sqrt(D),
+            sinks=sinks,
+        )
+        err = (out_v3.float() - ref).abs()
+        max_err, mean_err = err.max().item(), err.mean().item()
+        cos = torch.nn.functional.cosine_similarity(
+            out_v3.float().flatten().unsqueeze(0),
+            ref.flatten().unsqueeze(0),
+        ).item()
+        tag = (
+            f"[mixed-prefill-sinks {preset} Hq={Hq} Hk={Hk} D={D} Q_seq={Q_seq_pairs}]"
+        )
+        assert max_err < 1.5, f"{tag} max_err={max_err:.3f}"
+        assert mean_err < 0.05, f"{tag} mean_err={mean_err:.4f}"
+        assert cos > 0.98, (
+            f"{tag} cos={cos:.4f} (max_err={max_err:.4f} mean_err={mean_err:.4f})"
         )
