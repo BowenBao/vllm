@@ -1,25 +1,44 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unified (prefill + decode) Triton attention kernel for TurboQuant.
+"""ABLATION COPY of ``triton_turboquant_unified_attention.py`` (production v3,
+post-Opt#1+#2+#3).
 
-Structure is ported from ``vllm/v1/attention/ops/triton_unified_attention.py``
-(the AITER unified attention kernel already upstreamed into vLLM). Only the K
-and V load sites are replaced: instead of reading raw fp16 keys/values from
-two contiguous caches, this kernel reads TurboQuant-packed bytes from a single
-combined cache and dequantizes on the fly inside the tile loop.
+This file is a verbatim copy of the production v3 kernel with compile-time
+``ABLATION_SKIP_*`` constexpr flags added at each load / dequant site in the
+K-tile and V-tile helpers. All flags default to 0 (off); with every flag off
+this kernel is bit-for-bit identical to production. Used exclusively by
+``benchmarks/bench_tq_ablation_breakdown.py`` to attribute per-component
+cost of the current v3 production kernel.
 
-Benefits over the v1/v2 decode-only kernels:
+Ablation flags (all constexpr, default 0):
 
-1. GQA heads are stacked into ``BLOCK_M`` and the Q·K and P·V ops are proper
-   ``tl.dot`` tensor-core operations (MFMA on MI300X).
-2. The same kernel handles decode (``BLOCK_Q=1``) and prefill
-   (``BLOCK_Q>1``) -- no more Python per-request for-loop for continuation
-   chunks.
-3. Only the subset of features exercised by the current TQ paths is kept
-   (causal, GQA). Sinks / softcap / ALiBi / sliding-window / qq-bias /
-   mm-prefix are deferred to follow-ups.
+    ABLATION_SKIP_K              Return a zero K-tile (all K HBM loads + dequant
+                            skipped). Δ vs full isolates the **total K-side
+                            cost** (data load + centroid LUT + norm load +
+                            norm multiply).
+    ABLATION_SKIP_CENTROID       Keep the packed-byte load + nibble extract, but
+                            replace the centroid / pair-LUT gather with a
+                            cheap synthetic (``mse_idx / N_CENTROIDS``) so
+                            the downstream shape is preserved. Δ isolates
+                            **centroid-LUT indirection cost**.
+    ABLATION_SKIP_NORM_LOAD      Skip the per-tile K-norm HBM load; use
+                            ``vec_norms = 1.0``. Δ isolates **K metadata
+                            HBM load cost** (the post-Opt#2 wide load).
+    ABLATION_SKIP_V              Return a zero V-tile. Δ isolates **total V-side
+                            cost**.
+    ABLATION_SKIP_V_SCALE_LOAD   Skip the V scale / zero HBM loads; use
+                            scale=1.0, zero=0.0. Δ isolates **V metadata
+                            HBM load cost**.
 
-This is an opt-in v3 path behind ``VLLM_TQ_DECODE_V3``.
+Note: the pre-Opt#1 ``ABLATION_SKIP_NORM_CORRECTION_MATH`` flag from the earlier
+ablation is GONE because Opt#1 moved that math to store-time; there is no
+per-tile norm math left to skip in the current production kernel. The only
+remaining norm-correction work at decode time is the single multiply
+``K = c_vals * vec_norms[:, None]``, which is elided automatically by
+ABLATION_SKIP_NORM_LOAD (vec_norms=1 → multiply becomes a no-op for the
+attribution-relevant HBM cost).
+
+This is the ablation build. Do not import it in production paths.
 """
 
 from __future__ import annotations
@@ -33,6 +52,9 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops.triton_turboquant_decode import _use_fp8_e4b15
 from vllm.v1.attention.ops.triton_turboquant_decode_v2 import build_pair_lut
+from vllm.v1.attention.ops.triton_turboquant_unified_attention import (
+    _tq_fuse_q_rotation,
+)
 
 # reduce_segments is KV-format-agnostic: by the time it runs, K/V have been
 # consumed and only (max, expsum, partial_output) triples remain. Reuse the
@@ -70,49 +92,6 @@ def _find_seq_idx(
 
 
 # ---------------------------------------------------------------------------
-# Fused Q-rotation prologue (Opt: eliminates the launcher-side
-#   q_rot = (query.float() @ PiT).to(dtype).contiguous()
-# chain, which cost ~50-60 us/step at D=64 — all launch-bound, not compute-
-# bound. The fused version does one small MFMA inside the attention kernel,
-# once per program, before the KV-tile loop. PiT is [D,D] fp32 and fits in
-# L1 easily (16KB at D=64, 64KB at D=128).
-#
-# Algebra is identical to the launcher path: both compute Q_rot = Q @ PiT
-# with fp32 accumulate. Differences are rounding-order only (MFMA tiling
-# vs rocBLAS tiling), well within the 4-bit KV quant noise floor.
-# ---------------------------------------------------------------------------
-
-
-@triton.jit
-def _tq_fuse_q_rotation(
-    Q,  # [BLOCK_M, HEAD_SIZE_PADDED] — raw query in Q.dtype
-    PiT_ptr,
-    PiT_stride_0: tl.int64,
-    PiT_stride_1: tl.int64,
-    dim_mask,  # [HEAD_SIZE_PADDED] int1 — valid head dims
-    HEAD_SIZE_PADDED: tl.constexpr,
-):
-    """Fused Q @ PiT prologue. Called once per program for the MSE-key path
-    when the launcher has passed the raw (un-rotated) query. Returns the
-    rotated Q in the original dtype.
-    """
-    d_offs = tl.arange(0, HEAD_SIZE_PADDED)
-    pit_offsets = d_offs[:, None] * PiT_stride_0 + d_offs[None, :] * PiT_stride_1
-    pit_mask = dim_mask[:, None] & dim_mask[None, :]
-    PiT_tile = tl.load(PiT_ptr + pit_offsets, mask=pit_mask, other=0.0).to(tl.float32)
-    # input_precision="ieee" pins both inputs to full fp32 MFMA (no TF32
-    # truncation). allow_tf32 is intentionally omitted — Triton rejects
-    # passing both. This matches the launcher's rocBLAS fp32 GEMM in
-    # algebra; rounding-order differs, diff is <= a few fp16 ulp.
-    Q_rot = tl.dot(
-        Q.to(tl.float32),
-        PiT_tile,
-        input_precision="ieee",
-    )
-    return Q_rot.to(Q.dtype)
-
-
-# ---------------------------------------------------------------------------
 # TQ K-tile dequant: returns K_T : [HEAD_SIZE_PADDED, TILE_SIZE] in Q.dtype
 # ready for tl.dot(Q, K_T).
 #
@@ -143,6 +122,9 @@ def _tq_load_k_tile(
     NORM_CORRECTION: tl.constexpr,
     FP8_E4B15: tl.constexpr,
     TILE_SIZE: tl.constexpr,
+    ABLATION_SKIP_K: tl.constexpr = 0,
+    ABLATION_SKIP_CENTROID: tl.constexpr = 0,
+    ABLATION_SKIP_NORM_LOAD: tl.constexpr = 0,
 ):
     """Load + dequantize a TILE_SIZE × HEAD_SIZE block of keys and return
     the transposed tile K_T : [HEAD_SIZE_PADDED, TILE_SIZE].
@@ -154,6 +136,11 @@ def _tq_load_k_tile(
     are contiguous → one coalesced wide load replaces TILE_SIZE scattered
     loads (the whole point of Opt#3).
     """
+    # ── Ablation fast-exit: skip all K work, hand back zeros. ─────────────────
+    if ABLATION_SKIP_K:
+        K_T_zero = tl.zeros([BLOCK_D, TILE_SIZE], dtype=OUT_DTYPE)
+        _ = HEAD_DIM
+        return K_T_zero
     if KEY_FP8:
         k_addrs = data_bases[:, None] + d_offs[None, :]
         k_raw = tl.load(
@@ -182,14 +169,23 @@ def _tq_load_k_tile(
             ).to(tl.int32)
             lo_idx = byte_raw & 0xF
             hi_idx = (byte_raw >> 4) & 0xF
-            pair_key = lo_idx * N_CENTROIDS + hi_idx
-            pair_slot = tl.arange(0, 2)
-            c_pair = tl.load(
-                Pair_lut_ptr + pair_key[:, :, None] * 2 + pair_slot[None, None, :],
-                mask=(tile_mask[:, None, None] & byte_mask[None, :, None]),
-                other=0.0,
-            )
-            c_vals = tl.reshape(c_pair, [TILE_SIZE, BLOCK_D])
+            if ABLATION_SKIP_CENTROID:
+                # Keep the decoded indices alive so the packed-byte load above
+                # is not DCE'd. Shape must match the non-skip path:
+                # [TILE_SIZE, BLOCK_D]. Interleave lo, hi across pairs.
+                c_lo = lo_idx.to(tl.float32) * (1.0 / N_CENTROIDS)
+                c_hi = hi_idx.to(tl.float32) * (1.0 / N_CENTROIDS)
+                c_pair_syn = tl.join(c_lo, c_hi)  # [TILE_SIZE, HALF_D, 2]
+                c_vals = tl.reshape(c_pair_syn, [TILE_SIZE, BLOCK_D])
+            else:
+                pair_key = lo_idx * N_CENTROIDS + hi_idx
+                pair_slot = tl.arange(0, 2)
+                c_pair = tl.load(
+                    Pair_lut_ptr + pair_key[:, :, None] * 2 + pair_slot[None, None, :],
+                    mask=(tile_mask[:, None, None] & byte_mask[None, :, None]),
+                    other=0.0,
+                )
+                c_vals = tl.reshape(c_pair, [TILE_SIZE, BLOCK_D])
         elif MSE_BITS == 4:
             half_idx = d_offs // 2
             nibble_shift = (d_offs % 2) * 4
@@ -200,11 +196,14 @@ def _tq_load_k_tile(
                 other=0,
             ).to(tl.int32)
             mse_idx = (mse_raw >> nibble_shift[None, :]) & 0xF
-            c_vals = tl.load(
-                Centroids_ptr + mse_idx,
-                mask=tile_mask[:, None] & d_mask[None, :],
-                other=0.0,
-            )
+            if ABLATION_SKIP_CENTROID:
+                c_vals = mse_idx.to(tl.float32) * (1.0 / N_CENTROIDS)
+            else:
+                c_vals = tl.load(
+                    Centroids_ptr + mse_idx,
+                    mask=tile_mask[:, None] & d_mask[None, :],
+                    other=0.0,
+                )
         else:
             # Generic bit extraction (3-bit, etc.)
             mse_bit_off = d_offs * MSE_BITS
@@ -224,11 +223,14 @@ def _tq_load_k_tile(
             ).to(tl.int32)
             raw16 = mse_raw0 | (mse_raw1 << 8)
             mse_idx = (raw16 >> mse_bit_shift[None, :]) & mse_mask_val
-            c_vals = tl.load(
-                Centroids_ptr + mse_idx,
-                mask=tile_mask[:, None] & d_mask[None, :],
-                other=0.0,
-            )
+            if ABLATION_SKIP_CENTROID:
+                c_vals = mse_idx.to(tl.float32) * (1.0 / N_CENTROIDS)
+            else:
+                c_vals = tl.load(
+                    Centroids_ptr + mse_idx,
+                    mask=tile_mask[:, None] & d_mask[None, :],
+                    other=0.0,
+                )
 
         # Opt#1: 1/||c_vec|| is pre-folded into the stored K-norm at store
         # time, so the kernel doesn't recompute norm-correction here.
@@ -236,8 +238,13 @@ def _tq_load_k_tile(
         # region when the tile lies within one block (always true for
         # aligned decode tiles with TILE_SIZE == BLOCK_SIZE) — one coalesced
         # u16 load replaces TILE_SIZE scattered 2-byte loads.
-        norm_u16 = tl.load(KV_cache_u16_ptr + knorm_u16_addrs, mask=tile_mask, other=0)
-        vec_norms = norm_u16.to(tl.float16, bitcast=True).to(tl.float32)
+        if ABLATION_SKIP_NORM_LOAD:
+            vec_norms = tl.full([TILE_SIZE], 1.0, dtype=tl.float32)
+        else:
+            norm_u16 = tl.load(
+                KV_cache_u16_ptr + knorm_u16_addrs, mask=tile_mask, other=0
+            )
+            vec_norms = norm_u16.to(tl.float16, bitcast=True).to(tl.float32)
         K = c_vals * vec_norms[:, None]  # [TILE_SIZE, HEAD_SIZE_PADDED]
 
     K_T = tl.trans(K.to(OUT_DTYPE))  # [HEAD_SIZE_PADDED, TILE_SIZE]
@@ -264,6 +271,10 @@ def _tq_load_v_tile(
     OUT_DTYPE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     VQB: tl.constexpr,
+    BLOCK_D: tl.constexpr,  # HEAD_SIZE_PADDED (needed to shape skip path)
+    TILE_SIZE: tl.constexpr,
+    ABLATION_SKIP_V: tl.constexpr = 0,
+    ABLATION_SKIP_V_SCALE_LOAD: tl.constexpr = 0,
 ):
     """Load + dequantize a TILE_SIZE × HEAD_SIZE block of values.
 
@@ -275,6 +286,11 @@ def _tq_load_v_tile(
     boundaries, those addresses are contiguous → one coalesced wide load
     per field instead of TILE_SIZE scattered 2-byte loads.
     """
+    # ── Ablation fast-exit: skip all V work. ──────────────────────────────────
+    if ABLATION_SKIP_V:
+        V_zero = tl.zeros([TILE_SIZE, BLOCK_D], dtype=OUT_DTYPE)
+        _ = HEAD_DIM
+        return V_zero
     if VQB == 4:
         vb_idx = d_offs // 2
         vb_shift = (d_offs % 2) * 4
@@ -304,10 +320,16 @@ def _tq_load_v_tile(
         v_idx = ((raw16 >> val_bit_shift[None, :]) & 0x7).to(tl.float32)
 
     # SoA scale / zero loads — coalesced on aligned decode tiles.
-    scale_u16 = tl.load(KV_cache_u16_ptr + vscale_u16_addrs, mask=tile_mask, other=0)
-    zero_u16 = tl.load(KV_cache_u16_ptr + vzero_u16_addrs, mask=tile_mask, other=0)
-    v_scales = scale_u16.to(tl.float16, bitcast=True).to(tl.float32)
-    v_zeros = zero_u16.to(tl.float16, bitcast=True).to(tl.float32)
+    if ABLATION_SKIP_V_SCALE_LOAD:
+        v_scales = tl.full([TILE_SIZE], 1.0, dtype=tl.float32)
+        v_zeros = tl.full([TILE_SIZE], 0.0, dtype=tl.float32)
+    else:
+        scale_u16 = tl.load(
+            KV_cache_u16_ptr + vscale_u16_addrs, mask=tile_mask, other=0
+        )
+        zero_u16 = tl.load(KV_cache_u16_ptr + vzero_u16_addrs, mask=tile_mask, other=0)
+        v_scales = scale_u16.to(tl.float16, bitcast=True).to(tl.float32)
+        v_zeros = zero_u16.to(tl.float16, bitcast=True).to(tl.float32)
 
     V = v_idx * v_scales[:, None] + v_zeros[:, None]  # [TILE_SIZE, HEAD_SIZE_PADDED]
     _ = HEAD_DIM
@@ -375,6 +397,12 @@ def kernel_tq_unified_attention_2d(
     NORM_CORRECTION: tl.constexpr = 0,
     FP8_E4B15: tl.constexpr = 0,
     FUSE_Q_ROT: tl.constexpr = 0,  # Fused Q @ PiT prologue when 1 (MSE path)
+    # ── Ablation gates (compile-time; all 0 = bit-identical to production) ──
+    ABLATION_SKIP_K: tl.constexpr = 0,
+    ABLATION_SKIP_CENTROID: tl.constexpr = 0,
+    ABLATION_SKIP_NORM_LOAD: tl.constexpr = 0,
+    ABLATION_SKIP_V: tl.constexpr = 0,
+    ABLATION_SKIP_V_SCALE_LOAD: tl.constexpr = 0,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -500,6 +528,9 @@ def kernel_tq_unified_attention_2d(
             NORM_CORRECTION=NORM_CORRECTION,
             FP8_E4B15=FP8_E4B15,
             TILE_SIZE=TILE_SIZE,
+            ABLATION_SKIP_K=ABLATION_SKIP_K,
+            ABLATION_SKIP_CENTROID=ABLATION_SKIP_CENTROID,
+            ABLATION_SKIP_NORM_LOAD=ABLATION_SKIP_NORM_LOAD,
         )
 
         # ---- V : [TILE_SIZE, HEAD_SIZE_PADDED] in Q.dtype ----
@@ -515,6 +546,10 @@ def kernel_tq_unified_attention_2d(
             OUT_DTYPE=Q.dtype,
             HEAD_DIM=HEAD_SIZE,
             VQB=VQB,
+            BLOCK_D=HEAD_SIZE_PADDED,
+            TILE_SIZE=TILE_SIZE,
+            ABLATION_SKIP_V=ABLATION_SKIP_V,
+            ABLATION_SKIP_V_SCALE_LOAD=ABLATION_SKIP_V_SCALE_LOAD,
         )
 
         # S : [BLOCK_M, TILE_SIZE]
@@ -623,6 +658,12 @@ def kernel_tq_unified_attention_3d(
     NORM_CORRECTION: tl.constexpr = 0,
     FP8_E4B15: tl.constexpr = 0,
     FUSE_Q_ROT: tl.constexpr = 0,  # Fused Q @ PiT prologue when 1 (MSE path)
+    # ── Ablation gates (compile-time; all 0 = bit-identical to production) ──
+    ABLATION_SKIP_K: tl.constexpr = 0,
+    ABLATION_SKIP_CENTROID: tl.constexpr = 0,
+    ABLATION_SKIP_NORM_LOAD: tl.constexpr = 0,
+    ABLATION_SKIP_V: tl.constexpr = 0,
+    ABLATION_SKIP_V_SCALE_LOAD: tl.constexpr = 0,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -753,6 +794,9 @@ def kernel_tq_unified_attention_3d(
             NORM_CORRECTION=NORM_CORRECTION,
             FP8_E4B15=FP8_E4B15,
             TILE_SIZE=TILE_SIZE,
+            ABLATION_SKIP_K=ABLATION_SKIP_K,
+            ABLATION_SKIP_CENTROID=ABLATION_SKIP_CENTROID,
+            ABLATION_SKIP_NORM_LOAD=ABLATION_SKIP_NORM_LOAD,
         )
 
         V = _tq_load_v_tile(
@@ -767,6 +811,10 @@ def kernel_tq_unified_attention_3d(
             OUT_DTYPE=Q.dtype,
             HEAD_DIM=HEAD_SIZE,
             VQB=VQB,
+            BLOCK_D=HEAD_SIZE_PADDED,
+            TILE_SIZE=TILE_SIZE,
+            ABLATION_SKIP_V=ABLATION_SKIP_V,
+            ABLATION_SKIP_V_SCALE_LOAD=ABLATION_SKIP_V_SCALE_LOAD,
         )
 
         S = scale * tl.dot(Q, K_T)
@@ -885,19 +933,20 @@ def triton_turboquant_unified_attention(
     num_kv_splits: int | None = None,
     force_2d: bool = False,
     fuse_q_rot: bool = True,
+    # ── Ablation knobs (pass-through to inner Triton kernels) ──
+    ablation_skip_k: int = 0,
+    ablation_skip_centroid: int = 0,
+    ablation_skip_norm_load: int = 0,
+    ablation_skip_v: int = 0,
+    ablation_skip_v_scale_load: int = 0,
 ) -> torch.Tensor:
     """Launch unified TQ attention (v3).
 
-    ``query`` carries *raw* query vectors. For the MSE-key path the query
-    has to be rotated by ``PiT`` before it can be multiplied against the
-    (already-rotated) stored K. By default (``fuse_q_rot=True``) that
-    rotation is done inside the attention kernel prologue as a single
-    small MFMA — no extra dispatch, no HBM round-trip. Setting
-    ``fuse_q_rot=False`` restores the original launcher path (fp32 rocBLAS
-    GEMM + casts + .contiguous()), which is kept as an A/B toggle for
-    bench harnesses; numerical results match the fused path to within a
-    few ulp of fp32 round-off. The FP8-key path never rotates Q regardless
-    of this flag.
+    ``query`` carries *raw* query vectors. For the MSE-key path we pre-rotate
+    ``query`` to ``q_rot = query @ PiT`` on the device (fp16/bf16 gemm via
+    rocBLAS/cuBLAS) and pass that to the kernel as ``query_ptr``. For the
+    FP8-key path the rotation is not needed (keys are stored as FP8 bytes,
+    no centroid LUT).
 
     ``tile_size`` defaults to ``32`` for prefill (``max_query_len > 1``) and
     ``16`` for pure decode (``max_query_len == 1``). Callers may override.
@@ -925,19 +974,11 @@ def triton_turboquant_unified_attention(
     cfg = _get_layout(D, mse_bits, value_quant_bits)
     _ = value_packed_size  # unused
 
-    # Q-rotation strategy:
-    #   * FP8-key path: no rotation at all (keys stored as fp8, no codebook).
-    #   * MSE-key path + fuse_q_rot=True (default): pass the raw query to the
-    #     kernel together with PiT and let the kernel's prologue do one
-    #     fp32 tl.dot(Q, PiT). Eliminates the launcher-side
-    #     (cast, rocBLAS GEMM, cast, contiguous) chain (~50-60 us/step at
-    #     D=64, all launch-bound — see bottleneck report §10).
-    #   * MSE-key path + fuse_q_rot=False: legacy launcher rotation. Kept
-    #     as an A/B toggle for bench harnesses.
-    #
-    # PiT is always materialized as fp32 D x D contiguous; the kernel loads
-    # it as fp32 (cheap, 16KB at D=64) and computes Q @ PiT with IEEE fp32
-    # accumulate via tl.dot.
+    # Q-rotation strategy (see production kernel for full rationale):
+    #   * FP8-key path: no rotation at all.
+    #   * MSE-key path + fuse_q_rot=True (default): pass raw query to the
+    #     kernel + PiT; prologue does tl.dot(Q, PiT) in fp32.
+    #   * MSE-key path + fuse_q_rot=False: legacy launcher rotation path.
     if key_fp8:
         q_rot = query.contiguous()
         apply_fuse_q_rot = False
@@ -950,12 +991,7 @@ def triton_turboquant_unified_attention(
         else:
             q_rot = (query.float() @ PiT).to(query.dtype).contiguous()
 
-    # PiT in fp32, contiguous. For the fused path this is what the kernel
-    # loads; for the legacy path it's passed through as a harmless tensor
-    # (never dereferenced under the FUSE_Q_ROT constexpr guard). On FP8
-    # path Pi may be unused at the call site, so we fall back to an
-    # arbitrary non-null tensor (reuse centroids) to satisfy Triton's
-    # non-null pointer requirement.
+    # PiT in fp32 for the fused prologue; harmless dummy otherwise.
     if (not key_fp8) and PiT is not None:
         PiT_f32 = PiT if PiT.dtype == torch.float32 else PiT.to(torch.float32)
         if not PiT_f32.is_contiguous():
@@ -963,7 +999,7 @@ def triton_turboquant_unified_attention(
         pit_stride_0 = PiT_f32.stride(0)
         pit_stride_1 = PiT_f32.stride(1)
     else:
-        PiT_f32 = centroids  # harmless dummy; not dereferenced when FUSE_Q_ROT=0
+        PiT_f32 = centroids  # never dereferenced when FUSE_Q_ROT=0
         pit_stride_0 = 0
         pit_stride_1 = 0
 
@@ -1123,6 +1159,11 @@ def triton_turboquant_unified_attention(
             NORM_CORRECTION=1 if norm_correction else 0,
             FP8_E4B15=fp8_e4b15,
             FUSE_Q_ROT=1 if apply_fuse_q_rot else 0,
+            ABLATION_SKIP_K=int(ablation_skip_k),
+            ABLATION_SKIP_CENTROID=int(ablation_skip_centroid),
+            ABLATION_SKIP_NORM_LOAD=int(ablation_skip_norm_load),
+            ABLATION_SKIP_V=int(ablation_skip_v),
+            ABLATION_SKIP_V_SCALE_LOAD=int(ablation_skip_v_scale_load),
             num_warps=4,
             num_stages=num_stages,
         )
@@ -1201,6 +1242,11 @@ def triton_turboquant_unified_attention(
         NORM_CORRECTION=1 if norm_correction else 0,
         FP8_E4B15=fp8_e4b15,
         FUSE_Q_ROT=1 if apply_fuse_q_rot else 0,
+        ABLATION_SKIP_K=int(ablation_skip_k),
+        ABLATION_SKIP_CENTROID=int(ablation_skip_centroid),
+        ABLATION_SKIP_NORM_LOAD=int(ablation_skip_norm_load),
+        ABLATION_SKIP_V=int(ablation_skip_v),
+        ABLATION_SKIP_V_SCALE_LOAD=int(ablation_skip_v_scale_load),
         num_warps=4,
         num_stages=num_stages,
     )
