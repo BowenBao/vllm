@@ -128,6 +128,12 @@ class TurboQuantConfig:
         TQ mode:
           - MSE indices: ceil(head_dim * key_mse_bits / 8) bytes
           - vec_norm:     2 bytes (float16)
+
+        Note: this is the *logical* per-key packed size (data + metadata),
+        which still determines the cache-slot allocation. With the Opt#3 SoA
+        layout (see `key_data_bytes`), the K-norm is stored in a separate
+        per-block metadata region; `key_packed_size` stays unchanged so the
+        total per-slot allocation is preserved.
         """
         if self.key_fp8:
             return self.head_dim  # 1 byte per element
@@ -145,15 +151,87 @@ class TurboQuantConfig:
         """Packed bytes for a single VALUE vector.
 
         Uniform quantization: ceil(head_dim * bits / 8) + 4 bytes (scale + zero fp16).
+
+        Note: same split convention as `key_packed_size`. With SoA, V-scale
+        and V-zero live in the per-block metadata region; `value_packed_size`
+        is preserved so overall slot allocation is unchanged.
         """
         data_bytes = math.ceil(self.head_dim * self.value_quant_bits / 8)
         return data_bytes + 4  # +2 scale(fp16) +2 zero(fp16)
+
+    # ── Opt#3 SoA layout -----------------------------------------------
+    # Data region per slot (no per-token metadata; metadata moves to the
+    # per-block SoA region at the tail of the block).
+
+    @property
+    def key_data_bytes(self) -> int:
+        """Pure KEY data bytes per slot, with metadata stripped out.
+
+        FP8 keys: D bytes of FP8 (no K-norm metadata exists).
+        MSE keys: ceil(D * mse_bits / 8) bytes of packed indices (K-norm
+        moves to the SoA metadata region).
+        """
+        if self.key_fp8:
+            return self.head_dim
+        return math.ceil(self.head_dim * self.key_mse_bits / 8)
+
+    @property
+    def value_data_bytes(self) -> int:
+        """Pure VALUE data bytes per slot (scale/zero stripped, moved to SoA)."""
+        return math.ceil(self.head_dim * self.value_quant_bits / 8)
+
+    @property
+    def data_bytes_per_slot(self) -> int:
+        """Pure data bytes per slot under the SoA layout (K data + V data)."""
+        return self.key_data_bytes + self.value_data_bytes
+
+    @property
+    def meta_bytes_per_slot(self) -> int:
+        """Per-slot metadata bytes that live in the SoA region.
+
+        MSE keys: 2 (K-norm) + 2 (V-scale) + 2 (V-zero) = 6.
+        FP8 keys: 2 (V-scale) + 2 (V-zero) = 4 (no K-norm for FP8).
+        """
+        v_meta = 4  # V scale + zero (fp16 each)
+        k_meta = 0 if self.key_fp8 else 2  # K-norm (fp16)
+        return k_meta + v_meta
+
+    # Field indices within a head's SoA metadata region (in fp16 elements).
+    # Layout per head: [k_norm_0..bs-1 | v_scale_0..bs-1 | v_zero_0..bs-1]
+    # For FP8 keys, k_norm region is omitted → [v_scale | v_zero].
+    @property
+    def soa_field_k_norm(self) -> int:
+        """fp16 element offset of the K-norm SoA array within a head's region,
+        as a multiple of block_size. Returns -1 if K-norm has no SoA array
+        (i.e. FP8 keys)."""
+        if self.key_fp8:
+            return -1
+        return 0
+
+    @property
+    def soa_field_v_scale(self) -> int:
+        """fp16 element offset of the V-scale SoA array (in block_size units)."""
+        return 0 if self.key_fp8 else 1
+
+    @property
+    def soa_field_v_zero(self) -> int:
+        """fp16 element offset of the V-zero SoA array (in block_size units)."""
+        return 1 if self.key_fp8 else 2
+
+    @property
+    def num_soa_fields(self) -> int:
+        """Total number of SoA metadata fields per head."""
+        return 2 if self.key_fp8 else 3
 
     @property
     def slot_size(self) -> int:
         """Total packed bytes per head per position (key + value combined).
 
-        Layout: [key_packed | value_packed]
+        Total is preserved under the SoA layout: data_bytes_per_slot +
+        meta_bytes_per_slot == key_packed_size + value_packed_size.
+        The physical allocation shape `[num_blocks, block_size, Hk,
+        slot_size_aligned]` is unchanged; only the interpretation of the
+        bytes within a block differs.
         """
         return self.key_packed_size + self.value_packed_size
 

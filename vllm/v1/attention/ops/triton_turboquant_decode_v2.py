@@ -69,6 +69,7 @@ def build_pair_lut(centroids: torch.Tensor) -> torch.Tensor:
 def _tq_decode_stage1_v2(
     Q_rot_ptr,
     KV_cache_ptr,
+    KV_cache_u16_ptr,  # uint16 view — Opt#3 SoA loads
     Block_table_ptr,
     Seq_lens_ptr,
     Centroids_ptr,
@@ -76,9 +77,7 @@ def _tq_decode_stage1_v2(
     Mid_o_ptr,
     stride_qb,
     stride_qh,
-    stride_cache_block,
-    stride_cache_pos,
-    stride_cache_head,
+    stride_cache_block,  # bytes per block (bs*H*slot_aligned)
     stride_bt_b,
     stride_mid_b,
     stride_mid_h,
@@ -93,9 +92,15 @@ def _tq_decode_stage1_v2(
     KV_GROUP_SIZE: tl.constexpr,
     MSE_BITS: tl.constexpr,
     MSE_BYTES: tl.constexpr,
-    KPS: tl.constexpr,
     VQB: tl.constexpr,
     VAL_DATA_BYTES: tl.constexpr,
+    # Opt#3 SoA layout
+    KEY_DATA_BYTES: tl.constexpr,
+    META_REGION_OFFSET: tl.constexpr,
+    NUM_SOA_FIELDS: tl.constexpr,
+    SOA_K_NORM: tl.constexpr,
+    SOA_V_SCALE: tl.constexpr,
+    SOA_V_ZERO: tl.constexpr,
     N_CENTROIDS: tl.constexpr,
     ATTN_SCALE: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -186,17 +191,33 @@ def _tq_decode_stage1_v2(
             other=0,
         ).to(tl.int64)
 
-        slot_bases = (
-            block_nums * stride_cache_block
-            + page_off.to(tl.int64) * stride_cache_pos
-            + tl.cast(kv_hid, tl.int64) * stride_cache_head
+        # Opt#3 SoA addressing: data region then per-block SoA metadata.
+        slot_within_block = page_off.to(tl.int64)
+        block_base = block_nums * stride_cache_block
+        DATA_BYTES_PER_SLOT: tl.constexpr = KEY_DATA_BYTES + VAL_DATA_BYTES
+        data_bases = (
+            block_base
+            + slot_within_block * (NUM_KV_HEADS * DATA_BYTES_PER_SLOT)
+            + tl.cast(kv_hid, tl.int64) * DATA_BYTES_PER_SLOT
+        )
+        head_meta_u16_base = (block_base + META_REGION_OFFSET) // 2 + tl.cast(
+            kv_hid, tl.int64
+        ) * (NUM_SOA_FIELDS * BLOCK_SIZE)
+        knorm_u16_addrs = (
+            head_meta_u16_base + SOA_K_NORM * BLOCK_SIZE + slot_within_block
+        )
+        vscale_u16_addrs = (
+            head_meta_u16_base + SOA_V_SCALE * BLOCK_SIZE + slot_within_block
+        )
+        vzero_u16_addrs = (
+            head_meta_u16_base + SOA_V_ZERO * BLOCK_SIZE + slot_within_block
         )
 
         # ============================================================
         # KEY DEQUANT → K_T: [BLOCK_D, TILE_SIZE] for tl.dot(Q, K_T)
         # ============================================================
         if KEY_FP8:
-            k_addrs = slot_bases[:, None] + d_offs[None, :]
+            k_addrs = data_bases[:, None] + d_offs[None, :]
             k_raw = tl.load(
                 KV_cache_ptr + k_addrs,
                 mask=kv_mask_1d[:, None] & d_mask[None, :],
@@ -230,7 +251,7 @@ def _tq_decode_stage1_v2(
                 # so this is equivalent to k < HEAD_DIM // 2.
                 byte_mask = (half_offs * 2) < HEAD_DIM
 
-                byte_addrs = slot_bases[:, None] + half_offs[None, :]
+                byte_addrs = data_bases[:, None] + half_offs[None, :]
                 byte_raw = tl.load(
                     KV_cache_ptr + byte_addrs,
                     mask=kv_mask_1d[:, None] & byte_mask[None, :],
@@ -257,7 +278,7 @@ def _tq_decode_stage1_v2(
                 # 4-bit without pair LUT: exploit byte alignment
                 half_idx = d_offs // 2
                 nibble_shift = (d_offs % 2) * 4
-                mse_addrs = slot_bases[:, None] + half_idx[None, :]
+                mse_addrs = data_bases[:, None] + half_idx[None, :]
                 mse_raw = tl.load(
                     KV_cache_ptr + mse_addrs,
                     mask=kv_mask_1d[:, None] & d_mask[None, :],
@@ -271,7 +292,7 @@ def _tq_decode_stage1_v2(
                 )
             else:
                 # Generic 3-bit path: two byte loads → 16-bit → shift/mask
-                mse_addrs0 = slot_bases[:, None] + mse_byte_idx[None, :]
+                mse_addrs0 = data_bases[:, None] + mse_byte_idx[None, :]
                 mse_raw0 = tl.load(
                     KV_cache_ptr + mse_addrs0,
                     mask=kv_mask_1d[:, None] & d_mask[None, :],
@@ -290,27 +311,17 @@ def _tq_decode_stage1_v2(
                     other=0.0,
                 )
 
-            if NORM_CORRECTION:
-                c_norm_sq = tl.sum(
-                    tl.where(d_mask[None, :], c_vals * c_vals, 0.0),
-                    axis=1,
-                )
-                c_inv_norm = 1.0 / tl.sqrt(c_norm_sq + 1e-16)
-                c_vals = c_vals * c_inv_norm[:, None]
+            # Opt#1: norm-correction is pre-folded into the stored per-token
+            # scalar at store time, so no per-tile sum+sqrt+divide here. The
+            # stored vec_norm carries ||k||/||c_vec||; multiply by c_vals
+            # below gives the original c_vec/||c_vec|| * ||k||.
 
-            # Load norms: [TILE_SIZE] fp16→fp32
-            norm_bases = slot_bases + MSE_BYTES
-            n_lo = tl.load(
-                KV_cache_ptr + norm_bases,
-                mask=kv_mask_1d,
-                other=0,
-            ).to(tl.uint16)
-            n_hi = tl.load(
-                KV_cache_ptr + norm_bases + 1,
-                mask=kv_mask_1d,
-                other=0,
-            ).to(tl.uint16)
-            vec_norms = (n_lo | (n_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+            # Opt#3: K-norms from per-block SoA region. Single u16 load per
+            # token; contiguous across tokens within a block.
+            norm_u16 = tl.load(
+                KV_cache_u16_ptr + knorm_u16_addrs, mask=kv_mask_1d, other=0
+            )
+            vec_norms = norm_u16.to(tl.float16, bitcast=True).to(tl.float32)
 
             # Reconstruct K: K_recon[t, d] = norm[t] * centroid[t, d]
             K_recon = c_vals * vec_norms[:, None]
@@ -338,8 +349,10 @@ def _tq_decode_stage1_v2(
 
         # ============================================================
         # VALUE DEQUANT → V: [TILE_SIZE, BLOCK_D] for tl.dot(P, V)
+        # Opt#3: V data lives at data_base + KEY_DATA_BYTES; scale/zero
+        # move to the SoA metadata region (one u16 load each per token).
         # ============================================================
-        val_bases = slot_bases + KPS
+        val_bases = data_bases + KEY_DATA_BYTES
 
         if VQB == 3:
             val_addrs0 = val_bases[:, None] + val_byte_idx[None, :]
@@ -355,42 +368,11 @@ def _tq_decode_stage1_v2(
             ).to(tl.int32)
             raw16 = val_raw0 | (val_raw1 << 8)
             v_idx = ((raw16 >> val_bit_shift[None, :]) & 0x7).to(tl.float32)
-
-            sc_bases = val_bases + VAL_DATA_BYTES
-            sc_lo = tl.load(
-                KV_cache_ptr + sc_bases,
-                mask=kv_mask_1d,
-                other=0,
-            ).to(tl.uint16)
-            sc_hi = tl.load(
-                KV_cache_ptr + sc_bases + 1,
-                mask=kv_mask_1d,
-                other=0,
-            ).to(tl.uint16)
-            v_scales = (
-                (sc_lo | (sc_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-            )
-            zr_lo = tl.load(
-                KV_cache_ptr + sc_bases + 2,
-                mask=kv_mask_1d,
-                other=0,
-            ).to(tl.uint16)
-            zr_hi = tl.load(
-                KV_cache_ptr + sc_bases + 3,
-                mask=kv_mask_1d,
-                other=0,
-            ).to(tl.uint16)
-            v_zeros = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-            V = v_idx * v_scales[:, None] + v_zeros[:, None]
         else:  # VQB == 4
             # OPT#3 (load-halving, value path): same pattern as OPT#1 for
-            # keys -- the previous code used `vb_idx = d_offs // 2`, which
-            # has the duplicate sequence [0,0,1,1,2,2,...], issuing every
-            # packed-value byte load TWICE per tile. Load each byte exactly
-            # once as [TILE_SIZE, HALF_D], decode both nibbles, then
-            # tl.interleave to [TILE_SIZE, BLOCK_D] with pattern
-            # [v_lo0, v_hi0, v_lo1, v_hi1, ...] matching the original dim
-            # layout expected by V = v_idx * v_scales + v_zeros.
+            # keys -- load each byte exactly once as [TILE_SIZE, HALF_D],
+            # decode both nibbles, then tl.interleave to [TILE_SIZE, BLOCK_D]
+            # with pattern [v_lo0, v_hi0, v_lo1, v_hi1, ...].
             V_HALF_D: tl.constexpr = BLOCK_D // 2
             v_half_offs = tl.arange(0, V_HALF_D)
             v_byte_mask = (v_half_offs * 2) < HEAD_DIM
@@ -405,32 +387,13 @@ def _tq_decode_stage1_v2(
             v_hi = ((val_byte >> 4) & 0xF).to(tl.float32)  # [T, HALF_D]
             v_idx = tl.interleave(v_lo, v_hi)  # [T, BLOCK_D]
 
-            sc_bases = val_bases + VAL_DATA_BYTES
-            sc_lo = tl.load(
-                KV_cache_ptr + sc_bases,
-                mask=kv_mask_1d,
-                other=0,
-            ).to(tl.uint16)
-            sc_hi = tl.load(
-                KV_cache_ptr + sc_bases + 1,
-                mask=kv_mask_1d,
-                other=0,
-            ).to(tl.uint16)
-            v_scales = (
-                (sc_lo | (sc_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-            )
-            zr_lo = tl.load(
-                KV_cache_ptr + sc_bases + 2,
-                mask=kv_mask_1d,
-                other=0,
-            ).to(tl.uint16)
-            zr_hi = tl.load(
-                KV_cache_ptr + sc_bases + 3,
-                mask=kv_mask_1d,
-                other=0,
-            ).to(tl.uint16)
-            v_zeros = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-            V = v_idx * v_scales[:, None] + v_zeros[:, None]
+        scale_u16 = tl.load(
+            KV_cache_u16_ptr + vscale_u16_addrs, mask=kv_mask_1d, other=0
+        )
+        zero_u16 = tl.load(KV_cache_u16_ptr + vzero_u16_addrs, mask=kv_mask_1d, other=0)
+        v_scales = scale_u16.to(tl.float16, bitcast=True).to(tl.float32)
+        v_zeros = zero_u16.to(tl.float16, bitcast=True).to(tl.float32)
+        V = v_idx * v_scales[:, None] + v_zeros[:, None]
 
         # P·V accumulation via tensor core MMA
         # P: [BLOCK_M, TILE_SIZE], V: [TILE_SIZE, BLOCK_D]
@@ -491,16 +454,16 @@ def _get_layout(D, mse_bits, value_quant_bits, key_packed_size):
     return cfg
 
 
-_pair_lut_cache: dict = {}
-
-
 def _get_pair_lut(centroids: torch.Tensor) -> torch.Tensor:
-    key = centroids.data_ptr()
-    lut = _pair_lut_cache.get(key)
-    if lut is None:
-        lut = build_pair_lut(centroids)
-        _pair_lut_cache[key] = lut
-    return lut
+    """Return a fresh pair-LUT for ``centroids`` on each call.
+
+    The LUT is tiny (N*N*2 fp32, e.g. 2KB for 4-bit MSE) so the build cost
+    is negligible compared to attention. We avoid caching by data_ptr()
+    because CUDA allocator memory reuse across different centroid tensors
+    can silently return a stale LUT (subtle correctness bug). If this ever
+    shows up on a profile, cache by a hash-of-values fingerprint instead.
+    """
+    return build_pair_lut(centroids)
 
 
 def triton_turboquant_decode_attention_v2(
@@ -545,6 +508,16 @@ def triton_turboquant_decode_attention_v2(
     del max_seq_len  # no longer used: splits is fixed via max_num_kv_splits
 
     cfg = _get_layout(D, mse_bits, value_quant_bits, key_packed_size)
+
+    # Opt#3 SoA layout constants (match store-side computation).
+    key_data_bytes = D if key_fp8 else cfg["mse_bytes"]
+    data_bytes_per_slot = key_data_bytes + cfg["val_data_bytes"]
+    meta_region_offset = block_size * Hk * data_bytes_per_slot
+    num_soa_fields = 2 if key_fp8 else 3
+    soa_k_norm = 0
+    soa_v_scale = 0 if key_fp8 else 1
+    soa_v_zero = 1 if key_fp8 else 2
+    kv_cache_u16 = kv_cache.view(torch.uint16)
 
     # Compute q_rot = q @ Pi.T
     if key_fp8:
@@ -598,6 +571,7 @@ def triton_turboquant_decode_attention_v2(
     _tq_decode_stage1_v2[grid](
         q_rot,
         kv_cache,
+        kv_cache_u16,
         block_table,
         seq_lens,
         centroids,
@@ -606,8 +580,6 @@ def triton_turboquant_decode_attention_v2(
         q_rot.stride(0),
         q_rot.stride(1),
         kv_cache.stride(0),
-        kv_cache.stride(1),
-        kv_cache.stride(2),
         block_table.stride(0),
         mid_o.stride(0),
         mid_o.stride(1),
@@ -622,9 +594,14 @@ def triton_turboquant_decode_attention_v2(
         KV_GROUP_SIZE=kv_group_size,
         MSE_BITS=mse_bits,
         MSE_BYTES=cfg["mse_bytes"],
-        KPS=key_packed_size,
         VQB=value_quant_bits,
         VAL_DATA_BYTES=cfg["val_data_bytes"],
+        KEY_DATA_BYTES=key_data_bytes,
+        META_REGION_OFFSET=meta_region_offset,
+        NUM_SOA_FIELDS=num_soa_fields,
+        SOA_K_NORM=soa_k_norm,
+        SOA_V_SCALE=soa_v_scale,
+        SOA_V_ZERO=soa_v_zero,
         N_CENTROIDS=n_centroids,
         ATTN_SCALE=scale,
         BLOCK_D=cfg["BLOCK_D"],

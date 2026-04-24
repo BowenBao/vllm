@@ -52,11 +52,18 @@ from vllm.v1.attention.ops.triton_turboquant_decode_v2 import (
     triton_turboquant_decode_attention_v2,
 )
 from vllm.v1.attention.ops.triton_turboquant_store import triton_turboquant_store
+from vllm.v1.attention.ops.triton_turboquant_unified_attention import (
+    triton_turboquant_decode_attention_v3,
+)
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 
 # Opt-in flag to dispatch decode path to the v2 Triton kernel.
 # v1 remains the default. Set VLLM_TQ_DECODE_V2=1 to enable v2.
+# Set VLLM_TQ_DECODE_V3=1 to enable v3 (unified prefill+decode kernel with
+# 2D/3D split-KV dispatch and BLOCK_M=128 prefill heuristic). v3 supersedes
+# v2 when enabled.
 _USE_TQ_V2 = os.environ.get("VLLM_TQ_DECODE_V2", "0") == "1"
+_USE_TQ_V3 = os.environ.get("VLLM_TQ_DECODE_V3", "0") == "1"
 
 _HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
 if _HAS_FLASH_ATTN:
@@ -505,6 +512,8 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             key_packed_size=self.tq_config.key_packed_size,
             value_quant_bits=self.tq_config.effective_value_quant_bits,
             key_fp8=self.tq_config.key_fp8,
+            centroids=layer._tq_centroids,
+            norm_correction=self.tq_config.norm_correction,
         )
 
     # ------------------------------------------------------------------ #
@@ -654,7 +663,29 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         dtype=attn_metadata.seq_lens.dtype,
                     )
                     synth_bt = attn_metadata.block_table[i : i + 1].expand(q_len, -1)
-                    if _USE_TQ_V2:
+                    if _USE_TQ_V3:
+                        # TODO(v3-sinks): v3 sink support lands in a follow-up
+                        # commit. For now this path silently drops sinks.
+                        out = triton_turboquant_decode_attention_v3(
+                            query=q_seq,
+                            kv_cache=kv_cache,
+                            block_table=synth_bt,
+                            seq_lens=synth_seq_lens,
+                            Pi=Pi,
+                            centroids=centroids,
+                            scale=self.scale,
+                            mse_bits=self.tq_config.key_mse_bits,
+                            key_packed_size=self.tq_config.key_packed_size,
+                            value_quant_bits=(
+                                self.tq_config.effective_value_quant_bits
+                            ),
+                            value_packed_size=self.tq_config.value_packed_size,
+                            max_seq_len=int(seq_len),
+                            key_fp8=self.tq_config.key_fp8,
+                            norm_correction=self.tq_config.norm_correction,
+                            PiT=PiT,
+                        )
+                    elif _USE_TQ_V2:
                         # v2 kernel does not support sinks yet; sink plumbing
                         # lives on v1 (and soon v3). v2 is opt-in for perf
                         # experiments only.
@@ -758,9 +789,21 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         k_cached = k_buf[:, :, :alloc_len, :].zero_()
         v_cached = v_buf[:, :, :alloc_len, :].zero_()
 
+        # Opt#3 SoA layout constants (must match store-side computation).
+        key_fp8 = self.tq_config.key_fp8
+        key_data_bytes = D if key_fp8 else mse_bytes
+        data_bytes_per_slot = key_data_bytes + val_data_bytes
+        meta_region_offset = block_size * Hk * data_bytes_per_slot
+        num_soa_fields = 2 if key_fp8 else 3
+        soa_k_norm = 0
+        soa_v_scale = 0 if key_fp8 else 1
+        soa_v_zero = 1 if key_fp8 else 2
+        kv_cache_u16 = kv_cache.view(torch.uint16)
+
         grid = (alloc_len, 1 * Hk)
         _tq_full_dequant_kv[grid](
             kv_cache,
+            kv_cache_u16,
             block_table,
             centroids,
             k_cached,
@@ -772,18 +815,21 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             v_cached.stride(1),
             v_cached.stride(2),
             kv_cache.stride(0),
-            kv_cache.stride(1),
-            kv_cache.stride(2),
             block_table.stride(0),
             HEAD_DIM=D,
             BLOCK_SIZE=block_size,
             NUM_KV_HEADS=Hk,
             MSE_BYTES=mse_bytes,
-            KPS=self.tq_config.key_packed_size,
             VQB=self.tq_config.effective_value_quant_bits,
             VAL_DATA_BYTES=val_data_bytes,
             MSE_BITS=self.tq_config.key_mse_bits,
-            KEY_FP8=1 if self.tq_config.key_fp8 else 0,
+            KEY_FP8=1 if key_fp8 else 0,
+            KEY_DATA_BYTES=key_data_bytes,
+            META_REGION_OFFSET=meta_region_offset,
+            NUM_SOA_FIELDS=num_soa_fields,
+            SOA_K_NORM=soa_k_norm,
+            SOA_V_SCALE=soa_v_scale,
+            SOA_V_ZERO=soa_v_zero,
             BLOCK_D=BLOCK_D,
             NORM_CORRECTION=1 if self.tq_config.norm_correction else 0,
             FP8_E4B15=_use_fp8_e4b15(device.index or 0),
@@ -866,7 +912,32 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             output_buf = getattr(layer, "_tq_output_buf", None)
             lse_buf = getattr(layer, "_tq_lse_buf", None)
 
-        if _USE_TQ_V2:
+        if _USE_TQ_V3:
+            # TODO(v3-sinks): v3 sink support lands in a follow-up commit.
+            # For now this path silently drops sinks.
+            result = triton_turboquant_decode_attention_v3(
+                query=query,
+                kv_cache=kv_cache,
+                block_table=attn_metadata.block_table,
+                seq_lens=attn_metadata.seq_lens,
+                Pi=Pi,
+                centroids=centroids,
+                scale=self.scale,
+                mse_bits=self.tq_config.key_mse_bits,
+                key_packed_size=self.tq_config.key_packed_size,
+                value_quant_bits=self.tq_config.effective_value_quant_bits,
+                value_packed_size=self.tq_config.value_packed_size,
+                max_seq_len=attn_metadata.max_seq_len,
+                key_fp8=self.tq_config.key_fp8,
+                norm_correction=self.tq_config.norm_correction,
+                PiT=PiT,
+                mid_o_buf=mid_o_buf,
+                output_buf=output_buf,
+                lse_buf=lse_buf,
+                buf_holder=layer,
+                max_num_kv_splits=self.max_num_kv_splits,
+            )
+        elif _USE_TQ_V2:
             # v2 kernel does not support sinks yet; sink plumbing lives on v1
             # (and soon v3). v2 is opt-in for perf experiments only.
             result = triton_turboquant_decode_attention_v2(
