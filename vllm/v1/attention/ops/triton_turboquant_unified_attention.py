@@ -338,6 +338,7 @@ def kernel_tq_unified_attention_2d(
     block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
     seq_lens_ptr,  # [num_seqs]
     query_start_len_ptr,  # [num_seqs+1]
+    sinks_ptr,  # [Hq] fp32 — per-head sink logits; dereferenced only when USE_SINKS
     scale,  # float32
     num_query_heads: tl.constexpr,
     num_queries_per_kv: tl.constexpr,
@@ -375,6 +376,7 @@ def kernel_tq_unified_attention_2d(
     NORM_CORRECTION: tl.constexpr = 0,
     FP8_E4B15: tl.constexpr = 0,
     FUSE_Q_ROT: tl.constexpr = 0,  # Fused Q @ PiT prologue when 1 (MSE path)
+    USE_SINKS: tl.constexpr = 0,  # Per-head sink logit folded into softmax denom
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -428,7 +430,20 @@ def kernel_tq_unified_attention_2d(
 
     block_table_offset = seq_idx * block_table_stride
 
-    M = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    # Online softmax state.
+    # When USE_SINKS=1 we fold a per-head sink logit s_h into the softmax
+    # denominator by initializing M = s_h, L = 1.0 (== exp(s_h - s_h)).
+    # The standard online-softmax update then correctly rescales the sink
+    # contribution as real tokens update M, and the final acc / L gives
+    # out_h = sum_i exp(q.k_i)*V_i / (exp(s_h) + sum_i exp(q.k_i)).
+    # Masked rows (query_mask_1 == 0) get -inf so the sink cannot pollute
+    # invalid (q_token, q_head) positions outside the real query range.
+    if USE_SINKS:
+        M = tl.load(
+            sinks_ptr + query_offset_1, mask=query_mask_1, other=float("-inf")
+        ).to(tl.float32)
+    else:
+        M = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_SIZE_PADDED], dtype=tl.float32)
 
@@ -587,6 +602,7 @@ def kernel_tq_unified_attention_3d(
     block_tables_ptr,
     seq_lens_ptr,
     query_start_len_ptr,
+    sinks_ptr,  # [Hq] fp32 — per-head sink logits; dereferenced only when USE_SINKS
     scale,
     num_query_heads: tl.constexpr,
     num_queries_per_kv: tl.constexpr,
@@ -623,6 +639,7 @@ def kernel_tq_unified_attention_3d(
     NORM_CORRECTION: tl.constexpr = 0,
     FP8_E4B15: tl.constexpr = 0,
     FUSE_Q_ROT: tl.constexpr = 0,  # Fused Q @ PiT prologue when 1 (MSE path)
+    USE_SINKS: tl.constexpr = 0,  # Per-head sink logit folded into softmax denom
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -683,7 +700,18 @@ def kernel_tq_unified_attention_3d(
 
     block_table_offset = seq_idx * block_table_stride
 
-    M = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    # Online softmax state. For the split-KV (3D) kernel we must fold the
+    # sink logit into *only* segment 0's (M, L) so that the stage-2 reducer
+    # — which is a standard online-softmax merge — counts the sink exactly
+    # once. Segments with segm_idx > 0 keep the plain -inf / 1.0 init and
+    # therefore carry no sink contribution; stage-2 then combines them.
+    # This mirrors the v1 sink pattern from PR #40663 (sid==0 init trick).
+    if USE_SINKS and segm_idx == 0:
+        M = tl.load(
+            sinks_ptr + query_offset_1, mask=query_mask_1, other=float("-inf")
+        ).to(tl.float32)
+    else:
+        M = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_SIZE_PADDED], dtype=tl.float32)
 
@@ -885,6 +913,7 @@ def triton_turboquant_unified_attention(
     num_kv_splits: int | None = None,
     force_2d: bool = False,
     fuse_q_rot: bool = True,
+    sinks: torch.Tensor | None = None,  # [Hq] float — per-head sink logits
 ) -> torch.Tensor:
     """Launch unified TQ attention (v3).
 
@@ -966,6 +995,23 @@ def triton_turboquant_unified_attention(
         PiT_f32 = centroids  # harmless dummy; not dereferenced when FUSE_Q_ROT=0
         pit_stride_0 = 0
         pit_stride_1 = 0
+
+    # Sinks: per-head fp32 logits, contiguous. The kernel only dereferences
+    # this pointer when USE_SINKS=1, so when the caller passes None we bind
+    # a harmless non-null tensor (centroids) to satisfy Triton's non-null
+    # pointer requirement. See the sink design notes in the 2D/3D kernel
+    # bodies and the v1 precedent from PR #40663 (sid==0 init trick).
+    if sinks is not None:
+        sinks_f32 = sinks if sinks.dtype == torch.float32 else sinks.to(torch.float32)
+        if not sinks_f32.is_contiguous():
+            sinks_f32 = sinks_f32.contiguous()
+        assert sinks_f32.numel() == Hq, (
+            f"sinks must have shape [Hq={Hq}], got numel={sinks_f32.numel()}"
+        )
+        use_sinks = True
+    else:
+        sinks_f32 = centroids  # harmless dummy; not dereferenced when USE_SINKS=0
+        use_sinks = False
 
     if output is None:
         output = torch.empty_like(query)
@@ -1088,6 +1134,7 @@ def triton_turboquant_unified_attention(
             block_tables_ptr=block_table,
             seq_lens_ptr=seq_lens,
             query_start_len_ptr=query_start_loc,
+            sinks_ptr=sinks_f32,
             scale=scale,
             num_query_heads=Hq,
             num_queries_per_kv=kv_group_size,
@@ -1123,6 +1170,7 @@ def triton_turboquant_unified_attention(
             NORM_CORRECTION=1 if norm_correction else 0,
             FP8_E4B15=fp8_e4b15,
             FUSE_Q_ROT=1 if apply_fuse_q_rot else 0,
+            USE_SINKS=1 if use_sinks else 0,
             num_warps=4,
             num_stages=num_stages,
         )
@@ -1167,6 +1215,7 @@ def triton_turboquant_unified_attention(
         block_tables_ptr=block_table,
         seq_lens_ptr=seq_lens,
         query_start_len_ptr=query_start_loc,
+        sinks_ptr=sinks_f32,
         scale=scale,
         num_query_heads=Hq,
         num_queries_per_kv=kv_group_size,
@@ -1201,6 +1250,7 @@ def triton_turboquant_unified_attention(
         NORM_CORRECTION=1 if norm_correction else 0,
         FP8_E4B15=fp8_e4b15,
         FUSE_Q_ROT=1 if apply_fuse_q_rot else 0,
+        USE_SINKS=1 if use_sinks else 0,
         num_warps=4,
         num_stages=num_stages,
     )
@@ -1259,6 +1309,7 @@ def triton_turboquant_decode_attention_v3(
     lse_buf: Any = None,
     buf_holder: Any = None,
     max_num_kv_splits: int = 32,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Decode-only convenience wrapper around ``triton_turboquant_unified_attention``.
 
@@ -1266,6 +1317,8 @@ def triton_turboquant_decode_attention_v3(
     and synthesizes a ``query_start_loc`` of ``[0, 1, 2, ..., B]``.
     ``max_num_kv_splits`` is forwarded to the unified launcher as the 3D
     split-KV segment count (capped per-call against ``max_seq_len``).
+    ``sinks`` (optional ``[Hq]`` fp32) are forwarded to the kernel which
+    folds them into the softmax denominator via the init-time trick.
     """
     del mid_o_buf, lse_buf, buf_holder
     B = query.shape[0]
@@ -1291,5 +1344,6 @@ def triton_turboquant_decode_attention_v3(
         max_query_len=1,
         max_seq_len=max_seq_len if max_seq_len > 0 else None,
         num_kv_splits=max_num_kv_splits,
+        sinks=sinks,
     )
     return out

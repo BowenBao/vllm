@@ -539,19 +539,22 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # When sinks are present, skip this fast path because the paged attention
         # block table setup is incorrect for batched sequences (all sequences
         # would incorrectly attend to concatenated K/V from all requests).
-        if self.sinks is None and attn_metadata.max_query_len == attn_metadata.max_seq_len:
-            if _HAS_FLASH_ATTN:
-                return flash_attn_varlen_func(
-                    q=query,
-                    k=key,
-                    v=value,
-                    cu_seqlens_q=attn_metadata.query_start_loc,
-                    cu_seqlens_k=attn_metadata.query_start_loc,
-                    max_seqlen_q=attn_metadata.max_query_len,
-                    max_seqlen_k=attn_metadata.max_query_len,
-                    softmax_scale=self.scale,
-                    causal=True,
-                )
+        if (
+            self.sinks is None
+            and attn_metadata.max_query_len == attn_metadata.max_seq_len
+            and _HAS_FLASH_ATTN
+        ):
+            return flash_attn_varlen_func(
+                q=query,
+                k=key,
+                v=value,
+                cu_seqlens_q=attn_metadata.query_start_loc,
+                cu_seqlens_k=attn_metadata.query_start_loc,
+                max_seqlen_q=attn_metadata.max_query_len,
+                max_seqlen_k=attn_metadata.max_query_len,
+                softmax_scale=self.scale,
+                causal=True,
+            )
 
         # Continuation or no flash_attn: per-request attention.
         # For continuation chunks (seq_len > q_len), we must attend to
@@ -664,8 +667,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     )
                     synth_bt = attn_metadata.block_table[i : i + 1].expand(q_len, -1)
                     if _USE_TQ_V3:
-                        # TODO(v3-sinks): v3 sink support lands in a follow-up
-                        # commit. For now this path silently drops sinks.
                         out = triton_turboquant_decode_attention_v3(
                             query=q_seq,
                             kv_cache=kv_cache,
@@ -684,6 +685,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                             key_fp8=self.tq_config.key_fp8,
                             norm_correction=self.tq_config.norm_correction,
                             PiT=PiT,
+                            sinks=self.sinks,
                         )
                     elif _USE_TQ_V2:
                         # v2 kernel does not support sinks yet; sink plumbing
@@ -913,8 +915,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             lse_buf = getattr(layer, "_tq_lse_buf", None)
 
         if _USE_TQ_V3:
-            # TODO(v3-sinks): v3 sink support lands in a follow-up commit.
-            # For now this path silently drops sinks.
             result = triton_turboquant_decode_attention_v3(
                 query=query,
                 kv_cache=kv_cache,
@@ -936,6 +936,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 lse_buf=lse_buf,
                 buf_holder=layer,
                 max_num_kv_splits=self.max_num_kv_splits,
+                sinks=self.sinks,
             )
         elif _USE_TQ_V2:
             # v2 kernel does not support sinks yet; sink plumbing lives on v1
