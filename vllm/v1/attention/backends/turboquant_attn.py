@@ -27,6 +27,7 @@ import torch.nn.functional as F
 
 from vllm.config import get_current_vllm_config
 from vllm.config.cache import CacheDType
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.turboquant.centroids import (
     get_centroids,
 )
@@ -64,6 +65,8 @@ from vllm.v1.worker.workspace import (
     is_workspace_manager_initialized,
 )
 
+logger = init_logger(__name__)
+
 # Opt-in flag to dispatch decode path to the v2 Triton kernel.
 # v1 remains the default. Set VLLM_TQ_DECODE_V2=1 to enable v2.
 # Set VLLM_TQ_DECODE_V3=1 to enable v3 (unified prefill+decode kernel with
@@ -76,6 +79,11 @@ _HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
 if _HAS_FLASH_ATTN:
     from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
 
+logger.info_once(
+    "TurboQuant has flash attn: %s, decode kernel: %s",
+    _HAS_FLASH_ATTN,
+    "v3" if _USE_TQ_V3 else "v2" if _USE_TQ_V2 else "v1",
+)
 # Continuation prefill: for small continuation chunks (q_len ≤ threshold),
 # use the TQ decode kernel directly instead of full-dequant + flash_attn.
 # do_kv_cache_update already stored all tokens to TQ cache, so the decode

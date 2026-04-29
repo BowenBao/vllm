@@ -125,7 +125,7 @@ def test_gpqa_correctness(config_filename):
     server_args.extend(
         [
             "--trust-remote-code",
-            "--enforce-eager",
+            # "--enforce-eager",
             "--disable-uvicorn-access-log",
         ]
     )
